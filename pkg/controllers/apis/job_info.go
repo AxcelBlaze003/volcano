@@ -22,7 +22,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
-	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 )
 
 // JobInfo struct.
@@ -39,7 +38,6 @@ type JobInfo struct {
 type PartitionInfo struct {
 	// Partition partitionID:{podName:pod}
 	Partition       map[string]map[string]*v1.Pod
-	MatchPolicy     []*scheduling.MatchPolicySpec
 	NetworkTopology *batch.NetworkTopologySpec
 }
 
@@ -75,11 +73,6 @@ func (ji *JobInfo) Clone() *JobInfo {
 		if partitionInfo.NetworkTopology != nil {
 			job.Partitions[taskName].NetworkTopology = partitionInfo.NetworkTopology.DeepCopy()
 		}
-		matchPolicy := make([]*scheduling.MatchPolicySpec, 0, len(partitionInfo.MatchPolicy))
-		for _, value := range partitionInfo.MatchPolicy {
-			matchPolicy = append(matchPolicy, value.DeepCopy())
-		}
-		job.Partitions[taskName].MatchPolicy = matchPolicy
 	}
 
 	return job
@@ -104,17 +97,11 @@ func (ji *JobInfo) SetJob(job *batch.Job) {
 			}
 			ji.Partitions[taskSpec.Name].NetworkTopology = nt
 		}
-		ji.Partitions[taskSpec.Name].MatchPolicy = make([]*scheduling.MatchPolicySpec, 0)
-		labelKey := fmt.Sprintf("volcano.sh/%s-subgroup-id", taskSpec.Name)
-		matchPolicySpec := &scheduling.MatchPolicySpec{
-			LabelKey: labelKey,
-		}
-		ji.Partitions[taskSpec.Name].MatchPolicy = append(ji.Partitions[taskSpec.Name].MatchPolicy, matchPolicySpec)
 	}
 	for taskName, podMap := range ji.Pods {
 		for _, pod := range podMap {
 			if partitionInfo, found := ji.Partitions[taskName]; found {
-				partitionID := getPartitionID(pod)
+				partitionID := GetPartitionID(pod)
 				if partitionID == "" {
 					continue
 				}
@@ -152,7 +139,7 @@ func (ji *JobInfo) AddPod(pod *v1.Pod) error {
 
 	if ji.Partitions != nil {
 		if partitionInfo, found := ji.Partitions[taskName]; found {
-			partitionID := getPartitionID(pod)
+			partitionID := GetPartitionID(pod)
 			if partitionID == "" {
 				return nil
 			}
@@ -190,7 +177,7 @@ func (ji *JobInfo) UpdatePod(pod *v1.Pod) error {
 
 	if ji.Partitions != nil {
 		if partitionInfo, found := ji.Partitions[taskName]; found {
-			partitionID := getPartitionID(pod)
+			partitionID := GetPartitionID(pod)
 			if partitionID == "" {
 				return nil
 			}
@@ -226,7 +213,7 @@ func (ji *JobInfo) DeletePod(pod *v1.Pod) error {
 
 	if ji.Partitions != nil {
 		if partitionInfo, found := ji.Partitions[taskName]; found {
-			partitionID := getPartitionID(pod)
+			partitionID := GetPartitionID(pod)
 			if partitionID == "" {
 				return nil
 			}
@@ -242,8 +229,27 @@ func (ji *JobInfo) DeletePod(pod *v1.Pod) error {
 	return nil
 }
 
-func getPartitionID(pod *v1.Pod) string {
-	value, ok := pod.Labels[batch.Partitionkey]
+// HasPod checks whether the given k8s pod exists in the JobInfo struct.
+func (ji *JobInfo) HasPod(pod *v1.Pod) bool {
+	taskName, found := pod.Annotations[batch.TaskSpecKey]
+	if !found {
+		return false
+	}
+	_, found = pod.Annotations[batch.JobVersion]
+	if !found {
+		return false
+	}
+
+	pods, found := ji.Pods[taskName]
+	if !found {
+		return false
+	}
+	_, found = pods[pod.Name]
+	return found
+}
+
+func GetPartitionID(pod *v1.Pod) string {
+	value, ok := pod.Labels[batch.TaskPartitionID]
 	if ok {
 		return value
 	}
