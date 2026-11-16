@@ -34,6 +34,7 @@ import (
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	vcapisv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	schedulingapi "volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/cache"
@@ -67,6 +68,7 @@ type TestCommonStruct struct {
 	HyperNodesSetByTier       map[int]sets.Set[string]
 	HyperNodes                map[string]sets.Set[string]
 	HyperNodesMap             map[string]*api.HyperNodeInfo
+	HyperNodesTierNameMap     api.HyperNodeTierNameMap
 	RealNodesList             map[string][]*api.NodeInfo
 	HyperNodesReadyToSchedule bool
 	PodGroups                 []*vcapisv1.PodGroup
@@ -105,6 +107,12 @@ type TestCommonStruct struct {
 	// MinimalBindCheck true will only check both bind num, false by default.
 	MinimalBindCheck bool
 
+	// Shard test configuration (optional). When NodesInShard is non-nil/non-empty,
+	// RegisterSession caller should set options.ServerOpts and ssn.NodesInShard after session is created.
+	ShardingMode string
+	ShardName    string
+	NodesInShard []string
+
 	// fake interface instance when check results need
 	stop       chan struct{}
 	binder     cache.Binder
@@ -115,11 +123,11 @@ type TestCommonStruct struct {
 
 var _ Interface = &TestCommonStruct{}
 
-// RegisterSession open session with tiers and configuration, and mock schedulerCache with self-defined FakeBinder and FakeEvictor
-func (test *TestCommonStruct) RegisterSession(tiers []conf.Tier, config []conf.Configuration) *framework.Session {
+// RegisterSession opens a Session with the supplied scheduler configuration and options.
+func (test *TestCommonStruct) RegisterSession(tiers []conf.Tier, config []conf.Configuration, opts ...framework.SessionOption) *framework.Session {
 	schedulerCache := test.createSchedulerCache()
 	RegisterPlugins(test.Plugins)
-	test.ssn = framework.OpenSession(schedulerCache, tiers, config)
+	test.ssn = framework.OpenSession(schedulerCache, tiers, config, opts...)
 	return test.ssn
 }
 
@@ -156,6 +164,7 @@ func (test *TestCommonStruct) createSchedulerCache() *cache.SchedulerCache {
 	}
 	// need to immediately run the cache to make sure the resources are added
 	schedulerCache.Run(test.stop)
+	schedulerCache.WaitForCacheSync(test.stop)
 
 	for _, node := range test.Nodes {
 		schedulerCache.AddOrUpdateNode(node)
@@ -178,6 +187,24 @@ func (test *TestCommonStruct) createSchedulerCache() *cache.SchedulerCache {
 	}
 	ready := new(atomic.Bool)
 	ready.Store(true)
+	for _, hni := range test.HyperNodesMap {
+		if hni.HyperNode == nil {
+			continue
+		}
+		for _, member := range hni.HyperNode.Spec.Members {
+			if member.Type != topologyv1alpha1.MemberTypeHyperNode {
+				continue
+			}
+			if member.Selector.ExactMatch == nil { // todo support other selector method
+				continue
+			}
+			child := member.Selector.ExactMatch.Name
+			hni.Children.Insert(child)
+			if childInfo, found := test.HyperNodesMap[child]; found {
+				childInfo.Parent = hni.Name
+			}
+		}
+	}
 	schedulerCache.HyperNodesInfo = schedulingapi.NewHyperNodesInfoWithCache(test.HyperNodesMap, test.HyperNodesSetByTier, test.HyperNodes, ready)
 
 	return schedulerCache

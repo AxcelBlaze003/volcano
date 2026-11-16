@@ -18,6 +18,7 @@ package validate
 
 import (
 	"fmt"
+	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	whv1 "k8s.io/api/admissionregistration/v1"
@@ -44,7 +45,7 @@ var service = &router.AdmissionService{
 			Name: "validatepodgroup.volcano.sh",
 			Rules: []whv1.RuleWithOperations{
 				{
-					Operations: []whv1.OperationType{whv1.Create},
+					Operations: []whv1.OperationType{whv1.Create, whv1.Update},
 					Rule: whv1.Rule{
 						APIGroups:   []string{schedulingv1beta1.SchemeGroupVersion.Group},
 						APIVersions: []string{schedulingv1beta1.SchemeGroupVersion.Version},
@@ -67,17 +68,20 @@ func Validate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 		return util.ToAdmissionResponse(err)
 	}
 
+	var errMsg string
 	switch ar.Request.Operation {
 	case admissionv1.Create:
-		err = validatePodGroup(podgroup)
+		errMsg = validatePodGroup(podgroup)
+	case admissionv1.Update:
+		errMsg = validatePodGroupTopology(podgroup)
 	default:
-		err = fmt.Errorf("unsupported operation %s", ar.Request.Operation)
+		errMsg = fmt.Sprintf("unsupported operation %s", ar.Request.Operation)
 	}
 
-	if err != nil {
+	if errMsg != "" {
 		return &admissionv1.AdmissionResponse{
 			Allowed: false,
-			Result:  &metav1.Status{Message: err.Error()},
+			Result:  &metav1.Status{Message: errMsg},
 		}
 	}
 
@@ -87,25 +91,106 @@ func Validate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 }
 
 // validatePodGroup validates a PodGroup when it's being created
-func validatePodGroup(pg *schedulingv1beta1.PodGroup) error {
-	return checkQueueState(pg.Spec.Queue)
+func validatePodGroup(pg *schedulingv1beta1.PodGroup) string {
+	var errs []string
+
+	if msg := checkQueueState(pg.Namespace, pg.Spec.Queue); msg != "" {
+		errs = append(errs, strings.TrimSpace(msg))
+	}
+	if msg := validateNetworkTopology(pg.Spec.NetworkTopology, pg.Spec.SubGroupPolicy); msg != "" {
+		errs = append(errs, strings.TrimSpace(msg))
+	}
+	if msg := validateTopologyAffinity(pg.Spec.TopologyAffinity); msg != "" {
+		errs = append(errs, strings.TrimSpace(msg))
+	}
+
+	return strings.Join(errs, "; ")
+}
+
+func validatePodGroupTopology(pg *schedulingv1beta1.PodGroup) string {
+	var errs []string
+	if msg := validateNetworkTopology(pg.Spec.NetworkTopology, pg.Spec.SubGroupPolicy); msg != "" {
+		errs = append(errs, strings.TrimSpace(msg))
+	}
+	if msg := validateTopologyAffinity(pg.Spec.TopologyAffinity); msg != "" {
+		errs = append(errs, strings.TrimSpace(msg))
+	}
+	return strings.Join(errs, "; ")
 }
 
 // checkQueueState verifies if the queue exists and is in the open state
-func checkQueueState(queueName string) error {
-	if queueName == "" {
-		return nil
+func checkQueueState(workloadNamespace, queueReference string) string {
+	if queueReference == "" {
+		return ""
 	}
 
-	queue, err := config.QueueLister.Get(queueName)
-	if err != nil {
-		return fmt.Errorf("unable to find queue: %v", err)
+	if err := util.ValidateWorkloadQueueReference(
+		workloadNamespace,
+		queueReference,
+		schedulingv1beta1.DefaultQueue,
+		config,
+		util.QueueReferenceValidationOptions{},
+	); err != nil {
+		return err.Error()
 	}
 
-	if queue.Status.State != schedulingv1beta1.QueueStateOpen {
-		return fmt.Errorf("can only submit PodGroup to queue with state `Open`, "+
-			"queue `%s` status is `%s`", queue.Name, queue.Status.State)
-	}
+	return ""
+}
 
-	return nil
+func validateNetworkTopology(networkTopology *schedulingv1beta1.NetworkTopologySpec, policies []schedulingv1beta1.SubGroupPolicySpec) string {
+	var errs []string
+	if networkTopology != nil && networkTopology.HighestTierAllowed != nil && networkTopology.HighestTierName != "" {
+		errs = append(errs, "must not specify 'highestTierAllowed' and 'highestTierName' in networkTopology simultaneously.")
+	}
+	for _, policy := range policies {
+		if policy.NetworkTopology != nil && policy.NetworkTopology.HighestTierAllowed != nil && policy.NetworkTopology.HighestTierName != "" {
+			errs = append(errs, fmt.Sprintf("in subGroupPolicy '%s': must not specify 'highestTierAllowed' and 'highestTierName' in networkTopology simultaneously.", policy.Name))
+		}
+	}
+	return strings.Join(errs, " ")
+}
+
+func validateTopologyAffinity(topologyAffinity *schedulingv1beta1.TopologyAffinitySpec) string {
+	if topologyAffinity == nil {
+		return ""
+	}
+	var errs []string
+	if anti := topologyAffinity.PodGroupAntiAffinity; anti != nil {
+		for index, term := range anti.Required {
+			errs = append(errs, validatePodGroupAffinityTerm(
+				fmt.Sprintf("topologyAffinity.podGroupAntiAffinity.required[%d]", index), term, true)...)
+		}
+		for index, term := range anti.Preferred {
+			errs = append(errs, validatePodGroupAffinityTerm(
+				fmt.Sprintf("topologyAffinity.podGroupAntiAffinity.preferred[%d]", index), term, false)...)
+		}
+	}
+	return strings.Join(errs, "; ")
+}
+
+func validatePodGroupAffinityTerm(path string, term schedulingv1beta1.PodGroupAffinityTerm, required bool) []string {
+	var errs []string
+	if required && term.Weight != 0 {
+		errs = append(errs, fmt.Sprintf("%s: weight must not be set on required terms", path))
+	}
+	if !required && (term.Weight < 1 || term.Weight > 100) {
+		errs = append(errs, fmt.Sprintf("%s: weight must be an integer in the range 1-100 for preferred terms", path))
+	}
+	if term.PodGroupSelector == nil {
+		errs = append(errs, fmt.Sprintf("%s: podGroupSelector is required", path))
+	} else if _, err := metav1.LabelSelectorAsSelector(term.PodGroupSelector); err != nil {
+		errs = append(errs, fmt.Sprintf("%s: invalid podGroupSelector: %v", path, err))
+	}
+	if term.NamespaceSelector != nil {
+		if _, err := metav1.LabelSelectorAsSelector(term.NamespaceSelector); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: invalid namespaceSelector: %v", path, err))
+		}
+	}
+	if term.TopologyTier != nil && term.TopologyTierName != "" {
+		errs = append(errs, fmt.Sprintf("%s: must not specify topologyTier and topologyTierName simultaneously", path))
+	}
+	if term.TopologyTier == nil && term.TopologyTierName == "" {
+		errs = append(errs, fmt.Sprintf("%s: must specify topologyTier or topologyTierName", path))
+	}
+	return errs
 }

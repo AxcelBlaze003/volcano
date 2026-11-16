@@ -29,6 +29,43 @@ const (
 	nodeAffinity                 = "node(s) didn't match Pod's node affinity/selector"
 )
 
+// TestFitErrorsNodePluginInsufficientResourcesSurvivesFitErrors proves that a
+// Status's structured InsufficientResources dimensions are preserved intact
+// through SetNodeError/NewFitErrWithStatus and are recoverable per-node via
+// NodePluginInsufficientResources, so resource-fit blocker collection never
+// needs to parse the human-readable Reason string.
+func TestFitErrorsNodePluginInsufficientResourcesSurvivesFitErrors(t *testing.T) {
+	fitErrors := NewFitErrors()
+	fitErrors.SetNodeError("node-a", NewFitErrWithStatus(&TaskInfo{}, &NodeInfo{Name: "node-a"},
+		&Status{Code: Unschedulable, Plugin: "resource-fit", Reason: WrapInsufficientResourceReason([]string{"cpu", "memory"}), InsufficientResources: []string{"cpu", "memory"}}))
+	fitErrors.SetNodeError("node-b", NewFitErrWithStatus(&TaskInfo{}, &NodeInfo{Name: "node-b"},
+		&Status{Code: Unschedulable, Plugin: "resource-fit", Reason: NodePodNumberExceeded, InsufficientResources: []string{"pods"}}))
+	fitErrors.SetNodeError("node-c", NewFitErrWithStatus(&TaskInfo{}, &NodeInfo{Name: "node-c"},
+		&Status{Code: Unschedulable, Plugin: "node-affinity"}))
+
+	got := fitErrors.NodePluginInsufficientResources("resource-fit")
+	assert.ElementsMatch(t, []string{"cpu", "memory"}, got["node-a"])
+	assert.ElementsMatch(t, []string{"pods"}, got["node-b"])
+	assert.NotContains(t, got, "node-c", "node rejected by a different plugin must not appear")
+}
+
+// TestFitErrorsNodePluginInsufficientResourcesFailsOpenWithoutStructuredDetail
+// proves that a node carrying an Unschedulable/UnschedulableAndUnresolvable
+// status for the target plugin but no populated InsufficientResources is
+// still reported (with a nil slice) rather than silently dropped, so callers
+// can detect "rejected with no structured detail" and fail open instead of
+// treating the node as if it had no resource-fit blocker at all.
+func TestFitErrorsNodePluginInsufficientResourcesFailsOpenWithoutStructuredDetail(t *testing.T) {
+	fitErrors := NewFitErrors()
+	fitErrors.SetNodeError("node-a", NewFitErrWithStatus(&TaskInfo{}, &NodeInfo{Name: "node-a"},
+		&Status{Code: Unschedulable, Plugin: "resource-fit"}))
+
+	got := fitErrors.NodePluginInsufficientResources("resource-fit")
+	dims, ok := got["node-a"]
+	assert.True(t, ok, "node rejected by the plugin must be present in the result even with no structured dimensions")
+	assert.Empty(t, dims)
+}
+
 func TestFitError(t *testing.T) {
 	tests := []struct {
 		task   *TaskInfo
@@ -80,11 +117,12 @@ func TestFitError(t *testing.T) {
 
 func TestFitErrors(t *testing.T) {
 	tests := []struct {
-		node   string
-		fitStr string
-		err    error
-		fiterr *FitError
-		want   string // expected error string
+		node      string
+		fitStr    string
+		hyperNode string
+		err       error
+		fiterr    *FitError
+		want      string // expected error string
 		// nodes that are not helpful for preempting, which has a code of UnschedulableAndUnresolvable
 		filterNodes map[string]sets.Empty
 	}{
@@ -112,10 +150,28 @@ func TestFitErrors(t *testing.T) {
 			// only node2 has UnschedulableAndUnresolvable
 			filterNodes: map[string]sets.Empty{"node2": {}},
 		},
+		{
+			hyperNode: "hyperNode1",
+			node:      "node1",
+			err:       errors.New(NodePodNumberExceeded),
+			want:      "In hyperNode hyperNode1: 0/1 nodes are unavailable: 1 node(s) pod number exceeded.",
+			// no node has UnschedulableAndUnresolvable
+			filterNodes: map[string]sets.Empty{},
+		},
+		{
+			hyperNode: "hyperNode1",
+			node:      "node1",
+			fitStr:    "fit failed",
+			err:       errors.New(NodePodNumberExceeded),
+			want:      "In hyperNode hyperNode1: fit failed: 1 node(s) pod number exceeded.",
+			// no node has UnschedulableAndUnresolvable
+			filterNodes: map[string]sets.Empty{},
+		},
 	}
 	for _, test := range tests {
 		fitErrs := NewFitErrors()
 		fitErrs.SetError(test.fitStr)
+		fitErrs.SetHyperNode(test.hyperNode)
 		if test.err != nil {
 			fitErrs.SetNodeError(test.node, test.err)
 		}

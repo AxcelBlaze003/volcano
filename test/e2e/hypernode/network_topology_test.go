@@ -224,7 +224,7 @@ var _ = Describe("Network Topology Tests", func() {
 					{
 						Name:        "task-1-2",
 						Img:         e2eutil.DefaultNginxImage,
-						Req:         e2eutil.CPU2Mem2,
+						Req:         e2eutil.CPU4Mem4,
 						Min:         2,
 						Rep:         2,
 						Tolerations: tolerations,
@@ -472,6 +472,9 @@ var _ = Describe("Network Topology Tests", func() {
 
 			By("Kill pod of job")
 			e2eutil.DeletePod(ctx, jobPods[0])
+
+			By("Wait for the replacement pod to be running")
+			Expect(e2eutil.WaitPodRecreatedAndRunning(ctx, jobPods[0])).NotTo(HaveOccurred())
 
 			By("Wait for job running again")
 			Expect(e2eutil.WaitJobReady(ctx, topologyJob)).NotTo(HaveOccurred())

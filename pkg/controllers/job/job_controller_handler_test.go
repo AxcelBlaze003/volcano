@@ -79,6 +79,7 @@ func buildPod(namespace, name string, p v1.PodPhase, labels map[string]string) *
 			Name:            name,
 			Namespace:       namespace,
 			Labels:          labels,
+			Annotations:     map[string]string{"foo": "bar"},
 			ResourceVersion: string(uuid.NewUUID()),
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -109,6 +110,10 @@ func addPodAnnotation(pod *v1.Pod, annotations map[string]string) *v1.Pod {
 			podWithAnnotation.Annotations = make(map[string]string)
 		}
 		podWithAnnotation.Annotations[key] = value
+	}
+	if name := pod.Annotations[batch.JobNameKey]; name != "" {
+		job := testJobUID(&batch.Job{ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace, Name: name}})
+		pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(job, helpers.JobKind)}
 	}
 	return podWithAnnotation
 }
@@ -173,9 +178,9 @@ func TestJobAddFunc(t *testing.T) {
 	for i, testcase := range testCases {
 		t.Run(testcase.Name, func(t *testing.T) {
 			controller := newController()
-			controller.addJob(testcase.job)
+			controller.addJob(testJobUID(testcase.job))
 			key := fmt.Sprintf("%s/%s", testcase.job.Namespace, testcase.job.Name)
-			job, err := controller.cache.Get(key)
+			job, err := controller.cache.Get(types.UID(key))
 			if job == nil || err != nil {
 				t.Errorf("Error while Adding Job in case %d with error %s", i, err)
 			}
@@ -271,10 +276,10 @@ func TestUpdateJobFunc(t *testing.T) {
 	for i, testcase := range testcases {
 		t.Run(testcase.Name, func(t *testing.T) {
 			controller := newController()
-			controller.addJob(testcase.oldJob)
-			controller.updateJob(testcase.oldJob, testcase.newJob)
+			controller.addJob(testJobUID(testcase.oldJob))
+			controller.updateJob(testcase.oldJob, testJobUID(testcase.newJob))
 			key := fmt.Sprintf("%s/%s", testcase.newJob.Namespace, testcase.newJob.Name)
-			job, err := controller.cache.Get(key)
+			job, err := controller.cache.Get(types.UID(key))
 
 			if job == nil || job.Job == nil || err != nil {
 				t.Errorf("Error while Updating Job in case %d with error %s", i, err)
@@ -334,20 +339,45 @@ func TestAddPodFunc(t *testing.T) {
 			},
 			ExpectedValue: 1,
 		},
+		{
+			// This case ensures a pod that is already terminating (has DeletionTimestamp)
+			// is still added to the job cache correctly.
+			Name: "AddPod Success when pod is terminating",
+			Job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "job1",
+					Namespace: namespace,
+				},
+			},
+			pods: []*v1.Pod{
+				func() *v1.Pod {
+					p := buildPod(namespace, "pod1", v1.PodPending, nil)
+					now := metav1.Now()
+					p.DeletionTimestamp = &now
+					return p
+				}(),
+			},
+			Annotation: map[string]string{
+				batch.JobNameKey:  "job1",
+				batch.JobVersion:  "0",
+				batch.TaskSpecKey: "task1",
+			},
+			ExpectedValue: 1,
+		},
 	}
 
 	for i, testcase := range testcases {
 
 		t.Run(testcase.Name, func(t *testing.T) {
 			controller := newController()
-			controller.addJob(testcase.Job)
+			controller.addJob(testJobUID(testcase.Job))
 			for _, pod := range testcase.pods {
 				addPodAnnotation(pod, testcase.Annotation)
 				controller.addPod(pod)
 			}
 
 			key := fmt.Sprintf("%s/%s", testcase.Job.Namespace, testcase.Job.Name)
-			job, err := controller.cache.Get(key)
+			job, err := controller.cache.Get(types.UID(key))
 
 			if job == nil || job.Pods == nil || err != nil {
 				t.Errorf("Error while Getting Job in case %d with error %s", i, err)
@@ -409,19 +439,43 @@ func TestUpdatePodFunc(t *testing.T) {
 			},
 			ExpectedValue: v1.PodFailed,
 		},
+		{
+			// This case verifies that when the updated pod has a DeletionTimestamp
+			// (terminating), it remains in the job cache instead of being removed.
+			Name: "UpdatePod keeps terminating pod in cache",
+			Job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "job1",
+					Namespace: namespace,
+				},
+			},
+			oldPod: buildPod(namespace, "pod1", v1.PodRunning, nil),
+			newPod: func() *v1.Pod {
+				p := buildPod(namespace, "pod1", v1.PodRunning, nil)
+				now := metav1.Now()
+				p.DeletionTimestamp = &now
+				return p
+			}(),
+			Annotation: map[string]string{
+				batch.JobNameKey:  "job1",
+				batch.JobVersion:  "0",
+				batch.TaskSpecKey: "task1",
+			},
+			ExpectedValue: v1.PodRunning,
+		},
 	}
 
 	for i, testcase := range testcases {
 		t.Run(testcase.Name, func(t *testing.T) {
 			controller := newController()
-			controller.addJob(testcase.Job)
+			controller.addJob(testJobUID(testcase.Job))
 			addPodAnnotation(testcase.oldPod, testcase.Annotation)
 			addPodAnnotation(testcase.newPod, testcase.Annotation)
 			controller.addPod(testcase.oldPod)
 			controller.updatePod(testcase.oldPod, testcase.newPod)
 
 			key := fmt.Sprintf("%s/%s", testcase.Job.Namespace, testcase.Job.Name)
-			job, err := controller.cache.Get(key)
+			job, err := controller.cache.Get(types.UID(key))
 
 			if job == nil || job.Pods == nil || err != nil {
 				t.Errorf("Error while Getting Job in case %d with error %s", i, err)
@@ -492,7 +546,7 @@ func TestDeletePodFunc(t *testing.T) {
 	for i, testcase := range testcases {
 		t.Run(testcase.Name, func(t *testing.T) {
 			controller := newController()
-			controller.addJob(testcase.Job)
+			controller.addJob(testJobUID(testcase.Job))
 			for _, pod := range testcase.availablePods {
 				addPodAnnotation(pod, testcase.Annotation)
 				controller.addPod(pod)
@@ -501,7 +555,7 @@ func TestDeletePodFunc(t *testing.T) {
 			addPodAnnotation(testcase.deletePod, testcase.Annotation)
 			controller.deletePod(testcase.deletePod)
 			key := fmt.Sprintf("%s/%s", testcase.Job.Namespace, testcase.Job.Name)
-			job, err := controller.cache.Get(key)
+			job, err := controller.cache.Get(types.UID(key))
 
 			if job == nil || job.Pods == nil || err != nil {
 				t.Errorf("Error while Getting Job in case %d with error %s", i, err)
@@ -563,6 +617,7 @@ func TestUpdatePodGroupFunc(t *testing.T) {
 
 		t.Run(testcase.Name, func(t *testing.T) {
 			controller := newController()
+			testcase.newPodGroup.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(testJobUID(&batch.Job{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: testcase.newPodGroup.Name}}), helpers.JobKind)}
 			controller.updatePodGroup(testcase.oldPodGroup, testcase.newPodGroup)
 			key := fmt.Sprintf("%s/%s", testcase.oldPodGroup.Namespace, testcase.oldPodGroup.Name)
 			queue := controller.getWorkerQueue(key)
@@ -572,4 +627,11 @@ func TestUpdatePodGroupFunc(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testJobUID(job *batch.Job) *batch.Job {
+	if job.UID == "" {
+		job.UID = types.UID(job.Namespace + "/" + job.Name)
+	}
+	return job
 }

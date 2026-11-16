@@ -35,20 +35,31 @@ const (
 )
 
 /* Config Examples:
-   nvidia:
-     resourceCountName: "volcano.sh/vgpu"
-     ...
-   cambricon:
-     resourceCountName: "volcano.sh/vmlu"
-     ...
-   hygon:
-     resourceCountName: "volcano.sh/vdcu"
+
+   New HAMi wrapper format (recommended):
+   vnpus:
+     hamiVnpuCore: false
+     configs:
+     - chipName: 910B3
+       commonWord: Ascend910B3
+       ...
+
+   Legacy direct array format (still supported):
+   vnpus:
+   - chipName: 910B3
+     commonWord: Ascend910B3
      ...
 */
 
 type Config struct {
 	//NvidiaConfig is used for vGPU feature for nvidia, gpushare is not using this config
 	NvidiaConfig NvidiaConfig `yaml:"nvidia"`
+	VNPUs        VNPUsConfig  `yaml:"vnpus"`
+}
+
+// VNPUConfigs is a compatibility accessor for external consumers that used to access Config.VNPUs as a slice.
+func (c *Config) VNPUConfigs() []VNPUConfig {
+	return c.VNPUs.Configs
 }
 
 var (
@@ -97,6 +108,40 @@ func GetDefaultDevicesConfig() *Config {
 			DeviceCoreScaling:   1,
 			DisableCoreLimit:    false,
 		},
+		VNPUs: VNPUsConfig{
+			Configs: []VNPUConfig{
+				{
+					CommonWord:         "Ascend310P",
+					ChipName:           "310P3",
+					ResourceName:       "huawei.com/Ascend310P",
+					ResourceMemoryName: "huawei.com/Ascend310P-memory",
+					MemoryAllocatable:  21527,
+					MemoryCapacity:     24576,
+					AICore:             8,
+					AICPU:              7,
+					Templates: []Template{
+						{
+							Name:   "vir01",
+							Memory: 3072,
+							AICore: 1,
+							AICPU:  1,
+						},
+						{
+							Name:   "vir02",
+							Memory: 6144,
+							AICore: 2,
+							AICPU:  2,
+						},
+						{
+							Name:   "vir04",
+							Memory: 12288,
+							AICore: 4,
+							AICPU:  4,
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -106,8 +151,8 @@ func InitDevicesConfig(cmName, cmNamespace string) {
 		var err error
 		configs, err = loadConfigFromCM(devices.GetClient(), cmName, cmNamespace)
 		if err != nil {
-			klog.V(3).InfoS("Volcano device config not found in namespace kube-system, using default config",
-				"name", cmName)
+			klog.V(3).Infof("failed to load config from ConfigMap %s in namespace %s: %v. using default config.",
+				cmName, cmNamespace, err)
 			configs = GetDefaultDevicesConfig()
 		}
 		klog.V(3).InfoS("Initializing volcano device config", "device-configs", configs)

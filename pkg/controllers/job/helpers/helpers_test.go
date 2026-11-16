@@ -608,3 +608,138 @@ func TestGetTaskReplicasUnderJob(t *testing.T) {
 		})
 	}
 }
+
+func TestIsOutOfSyncPod(t *testing.T) {
+	testCases := []struct {
+		name     string
+		pod      *v1.Pod
+		expected bool
+	}{
+		{
+			name: "pod with out-of-sync annotation should return true",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-pod",
+					Annotations: map[string]string{
+						OutOfSyncKey: "true",
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "pod without out-of-sync annotation should return false",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-pod",
+					Annotations: map[string]string{
+						"other-key": "value",
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pod with no annotations should return false",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-pod",
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := IsOutOfSyncPod(tc.pod)
+
+			if result != tc.expected {
+				t.Errorf("expected IsOutOfSyncPod to return %v, got %v", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestOutOfSyncJSONPatch(t *testing.T) {
+	testCases := []struct {
+		name     string
+		expected string
+	}{
+		{
+			name:     "should generate valid JSON patch for out-of-sync annotation",
+			expected: `[{"op":"test","path":"/metadata/uid","value":"pod-uid"},{"op":"add","path":"/metadata/annotations/volcano.sh~1controller-out-of-sync","value":"true"}]`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := OutOfSyncJSONPatch("pod-uid")
+			resultStr := string(result)
+
+			if resultStr != tc.expected {
+				t.Errorf("expected JSON patch %q, got %q", tc.expected, resultStr)
+			}
+		})
+	}
+}
+
+func TestSplitTaskNames(t *testing.T) {
+	testCases := []struct {
+		name     string
+		value    string
+		expected []string
+	}{
+		{name: "single name", value: "worker", expected: []string{"worker"}},
+		{name: "comma separated names keep order", value: "worker,worker-0,worker-1", expected: []string{"worker", "worker-0", "worker-1"}},
+		{name: "empty value", value: "", expected: []string{}},
+		{name: "only commas", value: ",,", expected: []string{}},
+		{name: "trailing comma", value: "worker,", expected: []string{"worker"}},
+		{name: "spaces are trimmed", value: " worker , worker-0 ", expected: []string{"worker", "worker-0"}},
+	}
+
+	for index, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := SplitTaskNames(tc.value)
+			if len(actual) != len(tc.expected) {
+				t.Fatalf("Case %d (%s): expected %v, but got %v", index, tc.name, tc.expected, actual)
+			}
+			for i := range actual {
+				if actual[i] != tc.expected[i] {
+					t.Errorf("Case %d (%s): expected %v, but got %v", index, tc.name, tc.expected, actual)
+					break
+				}
+			}
+		})
+	}
+}
+
+func TestResolveWorkerNames(t *testing.T) {
+	testCases := []struct {
+		name     string
+		worker   string
+		workers  string
+		expected []string
+	}{
+		{name: "neither set falls back to caller default", worker: "", workers: "", expected: nil},
+		{name: "single worker name", worker: "worker", workers: "", expected: []string{"worker"}},
+		{name: "workers list keeps order", worker: "", workers: "worker-1,worker-0,worker", expected: []string{"worker-1", "worker-0", "worker"}},
+		{name: "workers takes precedence over worker", worker: "worker", workers: "worker-0,worker", expected: []string{"worker-0", "worker"}},
+		{name: "duplicates keep first occurrence only", worker: "", workers: "a, a,b,a", expected: []string{"a", "b"}},
+	}
+
+	for index, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := ResolveWorkerNames(tc.worker, tc.workers)
+			if len(actual) != len(tc.expected) {
+				t.Fatalf("Case %d (%s): expected %v, but got %v", index, tc.name, tc.expected, actual)
+			}
+			for i := range actual {
+				if actual[i] != tc.expected[i] {
+					t.Errorf("Case %d (%s): expected %v, but got %v", index, tc.name, tc.expected, actual)
+					break
+				}
+			}
+		})
+	}
+}

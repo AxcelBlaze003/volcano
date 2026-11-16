@@ -14,42 +14,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+VOLCANO_IMAGE_NAMES=(
+  "vc-controller-manager"
+  "vc-hypernode-controller-manager"
+  "vc-scheduler"
+  "vc-agent-scheduler"
+  "vc-webhook-manager"
+  "vc-agent"
+)
+
 # spin up cluster with kind command
 function kind-up-cluster {
   check-kind
 
   echo "Running kind: [kind create cluster ${CLUSTER_CONTEXT[*]} ${KIND_OPT}]"
-  kind create cluster "${CLUSTER_CONTEXT[@]}" ${KIND_OPT}
+  kind create cluster "${CLUSTER_CONTEXT[@]}" ${KIND_OPT} || exit 1
 
   echo
   check-images
 
   echo
   echo "Loading docker images into kind cluster"
-  # only need to load images into control-plane node because volcano components are deployed on control-plane node.
-  kind load docker-image ${IMAGE_PREFIX}/vc-controller-manager:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
-  kind load docker-image ${IMAGE_PREFIX}/vc-scheduler:${TAG}          "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
-  kind load docker-image ${IMAGE_PREFIX}/vc-webhook-manager:${TAG}    "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
+  # The Volcano components exercised by the E2E suites are deployed on the control-plane node.
+  for image_name in "${VOLCANO_IMAGE_NAMES[@]}"; do
+    kind load docker-image "${IMAGE_PREFIX}/${image_name}:${TAG}" "${CLUSTER_CONTEXT[@]}" --nodes "${CLUSTER_CONTEXT[1]}-control-plane"
+  done
+  if [[ -n "${KWOK_IMAGE_REPOSITORY:-}" && -n "${KWOK_IMAGE_TAG:-}" ]]; then
+    local kwok_image="${KWOK_IMAGE_REPOSITORY}:${KWOK_IMAGE_TAG}"
+    if docker image inspect "${kwok_image}" >/dev/null 2>&1; then
+      echo "Loading cached KWOK image ${kwok_image} into kind cluster"
+      # The KWOK controller is not pinned to the control-plane node, so every
+      # kind node must be able to start it without falling back to a registry pull.
+      kind load docker-image "${kwok_image}" "${CLUSTER_CONTEXT[@]}"
+    fi
+  fi
+  if [[ "${E2E_TYPE}" == "DRA" || "${E2E_TYPE}" == "ALL" ]]; then
+    ensure-dra-test-images
+  fi
+}
+
+function ensure-dra-test-images {
+  local dra_images=(
+    "nginx:1.29.3-alpine"
+    "registry.k8s.io/kwok/kwok:v0.7.0"
+    "registry.k8s.io/sig-storage/hostpathplugin:v1.16.1"
+  )
+
+  echo
+  echo "Ensuring DRA test images are available locally"
+  for image in "${dra_images[@]}"; do
+    if ! docker image inspect "${image}" >/dev/null 2>&1; then
+      echo "Pulling image ${image} ..."
+      docker pull "${image}" >/dev/null || exit 1
+    fi
+  done
+
+  echo
+  echo "Loading DRA test images into kind cluster"
+  for image in "${dra_images[@]}"; do
+    kind load docker-image "${image}" "${CLUSTER_CONTEXT[@]}" || exit 1
+  done
 }
 
 # check if the required images exist
 function check-images {
   echo "Checking whether the required images exist"
-  docker image inspect "${IMAGE_PREFIX}/vc-controller-manager:${TAG}" > /dev/null
-  if [[ $? -ne 0 ]]; then
-    echo -e "\033[31mERROR\033[0m: ${IMAGE_PREFIX}/vc-controller-manager:${TAG} does not exist"
-    exit 1
-  fi
-  docker image inspect "${IMAGE_PREFIX}/vc-scheduler:${TAG}" > /dev/null
-  if [[ $? -ne 0 ]]; then
-    echo -e "\033[31mERROR\033[0m: ${IMAGE_PREFIX}/vc-scheduler:${TAG} does not exist"
-    exit 1
-  fi
-  docker image inspect "${IMAGE_PREFIX}/vc-webhook-manager:${TAG}" > /dev/null
-  if [[ $? -ne 0 ]]; then
-    echo -e "\033[31mERROR\033[0m: ${IMAGE_PREFIX}/vc-webhook-manager:${TAG} does not exist"
-    exit 1
-  fi
+  for image_name in "${VOLCANO_IMAGE_NAMES[@]}"; do
+    if ! docker image inspect "${IMAGE_PREFIX}/${image_name}:${TAG}" > /dev/null; then
+      echo -e "\033[31mERROR\033[0m: ${IMAGE_PREFIX}/${image_name}:${TAG} does not exist"
+      exit 1
+    fi
+  done
 }
 
 # check if kubectl installed
@@ -70,7 +105,18 @@ function check-kind {
   which kind >/dev/null 2>&1
   if [[ $? -ne 0 ]]; then
     echo "Installing kind ..."
-    GOOS=${OS} go install sigs.k8s.io/kind@v0.30.0
+    GOOS=${OS} go install sigs.k8s.io/kind@v0.33.0
+    local bin_path
+    bin_path=$(go env GOBIN)
+    if [[ -z "${bin_path}" ]]; then
+      bin_path="$(go env GOPATH)/bin"
+    fi
+    export PATH="${bin_path}:${PATH}"
+    if ! command -v kind >/dev/null 2>&1; then
+      echo -e "\033[31mERROR\033[0m: kind installation completed but the binary is still not available on PATH"
+      exit 1
+    fi
+    echo -n "Using kind, version: " && kind version
   else
     echo -n "Found kind, version: " && kind version
   fi
@@ -92,20 +138,51 @@ function install-helm {
 
 function install-ginkgo-if-not-exist {
   echo "Checking ginkgo"
-  which ginkgo >/dev/null 2>&1
-  if [[ $? -ne 0 ]]; then
-    echo "Installing ginkgo ..."
-    GOOS=${OS} go install github.com/onsi/ginkgo/v2/ginkgo
-  else
-    echo -n "Found ginkgo, version: " && ginkgo version
+  local required_version
+  required_version=$(go list -m -f '{{.Version}}' github.com/onsi/ginkgo/v2 2>/dev/null)
+  if [[ -z "${required_version}" ]]; then
+    echo -e "\033[31mERROR\033[0m: failed to resolve required ginkgo version from go.mod"
+    exit 1
   fi
+
+  if command -v ginkgo >/dev/null 2>&1; then
+    local found_version
+    found_version=$(ginkgo version 2>/dev/null | awk '{print $3}')
+    found_version=${found_version#v}
+    local normalized_required=${required_version#v}
+    if [[ -z "${found_version}" ]]; then
+      echo "Unable to determine installed ginkgo version, reinstalling..."
+    elif [[ "${found_version}" == "${normalized_required}" ]]; then
+      echo "Found ginkgo, version: ${found_version}"
+      return
+    else
+      echo "Ginkgo version mismatch (found ${found_version}, required ${normalized_required}), reinstalling..."
+    fi
+  else
+    echo "Installing ginkgo ..."
+  fi
+
+  GOOS=${OS} go install github.com/onsi/ginkgo/v2/ginkgo@${required_version}
+  # This file is sourced (e.g. from hack/run-e2e-kind.sh), so updating PATH here
+  # ensures subsequent ginkgo invocations in the calling script use the installed binary.
+  local bin_path
+  bin_path=$(go env GOBIN)
+  if [[ -z "${bin_path}" ]]; then
+    bin_path="$(go env GOPATH)/bin"
+  fi
+  export PATH="${bin_path}:${PATH}"
+  echo -n "Using ginkgo, version: " && ginkgo version
 }
 
 function install-kwok-with-helm {
   helm repo add kwok https://kwok.sigs.k8s.io/charts/
   helm repo update
-  helm upgrade --namespace kube-system --install kwok kwok/kwok
-  helm upgrade --install kwok kwok/stage-fast
+  helm upgrade --namespace kube-system --install kwok kwok/kwok \
+    --version "${KWOK_CHART_VERSION}" \
+    --set image.repository="${KWOK_IMAGE_REPOSITORY}" \
+    --set image.tag="${KWOK_IMAGE_TAG}" \
+    --set image.pullPolicy=IfNotPresent
+  helm upgrade --install kwok kwok/stage-fast --version "${KWOK_CHART_VERSION}"
   # delete pod-complete stage to avoid volcano-job-pod change status to complete.
   kubectl delete stage pod-complete
 }

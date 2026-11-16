@@ -32,8 +32,9 @@ import (
 )
 
 type GPUUsage struct {
-	UsedMem  uint
-	UsedCore uint
+	UsedMem     uint
+	UsedCore    uint
+	PodGroupKey string // namespace/name of PodGroup, or "" if pod has no group
 }
 
 // GPUDevice include gpu id, memory and the pods that are sharing it.
@@ -98,14 +99,35 @@ func NewGPUDevices(name string, node *v1.Node) *GPUDevices {
 	if !ok {
 		return nil
 	}
-	handshake, ok := node.Annotations[deviceconfig.VolcanoVGPUHandshake]
-	if !ok {
+
+	if node.Status.Allocatable != nil {
+		gpuNumberRes, gpuNumberExists := node.Status.Allocatable[v1.ResourceName(deviceconfig.VolcanoVGPUNumber)]
+		if !gpuNumberExists || gpuNumberRes.Value() == 0 {
+			klog.V(3).Infof("Node %s does not have allocatable %s resource or value is 0, returning nil", node.Name, deviceconfig.VolcanoVGPUNumber)
+			return nil
+		}
+
+		vgpuCoresRes, vgpuCoresExists := node.Status.Allocatable[v1.ResourceName(deviceconfig.VolcanoVGPUCores)]
+		if !vgpuCoresExists || vgpuCoresRes.Value() == 0 {
+			klog.V(3).Infof("Node %s does not have allocatable %s resource or value is 0, returning nil", node.Name, deviceconfig.VolcanoVGPUCores)
+			return nil
+		}
+
+		vgpuMemoryRes, vgpuMemoryExists := node.Status.Allocatable[v1.ResourceName(deviceconfig.VolcanoVGPUMemory)]
+		if !vgpuMemoryExists || vgpuMemoryRes.Value() == 0 {
+			klog.V(3).Infof("Node %s does not have allocatable %s resource or value is 0, returning nil", node.Name, deviceconfig.VolcanoVGPUMemory)
+			return nil
+		}
+	} else {
+		klog.V(3).Infof("Node %s does not have allocatable resources information, returning nil", node.Name)
 		return nil
 	}
+
 	nodedevices, sharingMode := decodeNodeDevices(name, annos)
 	if (nodedevices == nil) || len(nodedevices.Device) == 0 {
 		return nil
 	}
+
 	sharingHandler, _ := GetSharingHandler(sharingMode)
 	klog.V(3).Infoln("GPU sharing mode: ", sharingMode)
 	for _, val := range nodedevices.Device {
@@ -113,24 +135,6 @@ func NewGPUDevices(name string, node *v1.Node) *GPUDevices {
 		ResetDeviceMetrics(val.UUID, node.Name, float64(val.Memory))
 	}
 
-	// We have to handshake here in order to avoid time-inconsistency between scheduler and nodes
-	if strings.Contains(handshake, "Requesting") {
-		formertime, _ := time.Parse("2006.01.02 15:04:05", strings.Split(handshake, "_")[1])
-		if time.Now().After(formertime.Add(time.Second * 60)) {
-			klog.V(3).Infof("node %v device %s leave", node.Name, handshake)
-
-			tmppat := make(map[string]string)
-			tmppat[deviceconfig.VolcanoVGPUHandshake] = "Deleted_" + time.Now().Format("2006.01.02 15:04:05")
-			patchNodeAnnotations(node, tmppat)
-			return nil
-		}
-	} else if strings.Contains(handshake, "Deleted") {
-		return nil
-	} else {
-		tmppat := make(map[string]string)
-		tmppat[deviceconfig.VolcanoVGPUHandshake] = "Requesting_" + time.Now().Format("2006.01.02 15:04:05")
-		patchNodeAnnotations(node, tmppat)
-	}
 	nodedevices.Sharing = sharingHandler
 	return nodedevices
 }
@@ -158,7 +162,7 @@ func (gs *GPUDevices) AddQueueResource(pod *v1.Pod) map[string]float64 {
 		klog.Errorf("pod %s has no annotation volcano.sh/devices-to-allocate", pod.Name)
 		return res
 	}
-	podDev := decodePodDevices(ids)
+	podDev := DecodePodDevices(ids)
 	for _, val := range podDev {
 		for _, deviceused := range val {
 			for _, gsdevice := range gs.Device {
@@ -188,18 +192,51 @@ func (gs *GPUDevices) addResource(annotations map[string]string, pod *v1.Pod) {
 		klog.Errorf("pod %s has no annotation volcano.sh/devices-to-allocate", pod.Name)
 		return
 	}
-	podDev := decodePodDevices(ids)
+	podDev := DecodePodDevices(ids)
 	for _, val := range podDev {
 		for _, deviceused := range val {
 			for index, gsdevice := range gs.Device {
 				if strings.Contains(deviceused.UUID, gsdevice.UUID) {
 					err := gs.Sharing.AddPod(gsdevice, deviceused.Usedmem, deviceused.Usedcores, string(pod.UID), deviceused.UUID)
 					if err == nil {
+						if u := gsdevice.PodMap[string(pod.UID)]; u != nil {
+							u.PodGroupKey = getPodGroupKey(pod)
+						}
 						gs.AddPodMetrics(index, string(pod.UID), pod.Name)
 					} else {
 						klog.ErrorS(err, "add resource failed")
 					}
 					break
+				}
+			}
+		}
+	}
+}
+
+func (gs *GPUDevices) addToPodMap(annotations map[string]string, pod *v1.Pod) {
+	ids, ok := annotations[AssignedIDsAnnotations]
+	if !ok {
+		klog.Errorf("pod %s has no annotation volcano.sh/devices-to-allocate", pod.Name)
+		return
+	}
+	podDev := DecodePodDevices(ids)
+	for _, val := range podDev {
+		for _, deviceused := range val {
+			for _, gsdevice := range gs.Device {
+				if strings.Contains(deviceused.UUID, gsdevice.UUID) {
+					podUID := string(pod.UID)
+					_, ok := gsdevice.PodMap[podUID]
+					if !ok {
+						gsdevice.PodMap[podUID] = &GPUUsage{
+							UsedMem:     0,
+							UsedCore:    0,
+							PodGroupKey: getPodGroupKey(pod),
+						}
+					}
+
+					gsdevice.PodMap[podUID].UsedMem += deviceused.Usedmem
+					gsdevice.PodMap[podUID].UsedCore += deviceused.Usedcores
+					gsdevice.PodMap[podUID].PodGroupKey = getPodGroupKey(pod)
 				}
 			}
 		}
@@ -215,7 +252,7 @@ func (gs *GPUDevices) SubResource(pod *v1.Pod) {
 	if !ok {
 		return
 	}
-	podDev := decodePodDevices(ids)
+	podDev := DecodePodDevices(ids)
 	for _, val := range podDev {
 		for _, deviceused := range val {
 			for index, gsdevice := range gs.Device {
@@ -240,8 +277,31 @@ func (gs *GPUDevices) HasDeviceRequest(pod *v1.Pod) bool {
 	return false
 }
 
-func (gs *GPUDevices) Release(kubeClient kubernetes.Interface, pod *v1.Pod) error {
-	return nil
+func (gs *GPUDevices) Release(kubeClient kubernetes.Interface, pod *v1.Pod) (*devices.DeviceReservation, error) {
+	if gs == nil || pod == nil {
+		return nil, nil
+	}
+	// Roll back the in-memory device ledger for UnPipeline/UnAllocate paths.
+	gs.SubResource(pod)
+
+	// Once binding succeeds, vgpu-device-plugin owns these annotations.
+	// The scheduler must not clean them again.
+	if pod.Annotations != nil && pod.Annotations[DeviceBindPhase] == "success" {
+		return nil, nil
+	}
+
+	keys := []string{
+		AssignedNodeAnnotations,          // volcano.sh/vgpu-node
+		AssignedIDsAnnotations,           // volcano.sh/vgpu-ids-new
+		AssignedIDsToAllocateAnnotations, // volcano.sh/devices-to-allocate
+		AssignedTimeAnnotations,          // volcano.sh/vgpu-time
+		BindTimeAnnotations,              // volcano.sh/bind-time
+		DeviceBindPhase,                  // volcano.sh/bind-phase
+	}
+	return &devices.DeviceReservation{
+		DeviceType:  DeviceName,
+		Annotations: devices.AnnotationKeyMap(keys),
+	}, nil
 }
 
 func (gs *GPUDevices) FilterNode(pod *v1.Pod, schedulePolicy string) (int, string, error) {
@@ -258,38 +318,88 @@ func (gs *GPUDevices) FilterNode(pod *v1.Pod, schedulePolicy string) (int, strin
 	return devices.Success, "", nil
 }
 
-func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
-	if VGPUEnable {
-		klog.V(4).Infoln("hami-vgpu DeviceSharing:Into AllocateToPod", pod.Name)
-		fit, device, _, err := checkNodeGPUSharingPredicateAndScore(pod, gs, false, "")
-		if err != nil || !fit {
-			klog.ErrorS(err, "Failed to allocate vgpu task", "pod", pod.Name)
-			return err
+func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) (*devices.DeviceReservation, error) {
+	if !VGPUEnable {
+		return nil, nil
+	}
+	klog.V(4).Infoln("hami-vgpu DeviceSharing:Into AllocateToPod", pod.Name)
+	fit, device, _, err := checkNodeGPUSharingPredicateAndScore(pod, gs, false, SchedulePolicy)
+	if err != nil || !fit {
+		klog.ErrorS(err, "Failed to allocate vgpu task", "pod", pod.Name)
+		return nil, err
+	}
+	if NodeLockEnable {
+		nodelock.UseClient(kubeClient)
+		err = nodelock.LockNode(gs.Name, DeviceName)
+		if err != nil {
+			return nil, errors.Errorf("node %s locked for %s hamivgpu lockname %s", gs.Name, pod.Name, err.Error())
 		}
-		if NodeLockEnable {
-			nodelock.UseClient(kubeClient)
-			err = nodelock.LockNode(gs.Name, DeviceName)
-			if err != nil {
-				return errors.Errorf("node %s locked for %s hamivgpu lockname %s", gs.Name, pod.Name, err.Error())
+	}
+
+	annotations := make(map[string]string)
+	annotations[AssignedNodeAnnotations] = gs.Name
+	annotations[AssignedTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
+	annotations[AssignedIDsAnnotations] = encodePodDevices(device)
+	annotations[AssignedIDsToAllocateAnnotations] = annotations[AssignedIDsAnnotations]
+	annotations[DeviceBindPhase] = "allocating"
+	annotations[BindTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
+
+	// Update the in-memory device ledger without mutating shared pod annotations.
+	// Passing annotations directly avoids concurrent reads/writes on the shared Pod map.
+	gs.addToPodMap(annotations, pod)
+
+	// Return allocation annotations so predicates can carry the same values on
+	// the binding request. The apiserver merges Binding annotations into the Pod
+	// atomically with node assignment.
+	return &devices.DeviceReservation{
+		DeviceType:  DeviceName,
+		Annotations: annotations,
+	}, nil
+}
+
+// DeepCopy returns a deep copy of GPUDevices for use in dry-run simulation.
+func (gs *GPUDevices) DeepCopy() interface{} {
+	if gs == nil {
+		return nil
+	}
+	cp := &GPUDevices{
+		Name:    gs.Name,
+		Mode:    gs.Mode,
+		Score:   gs.Score,
+		Sharing: gs.Sharing,
+		Device:  make(map[int]*GPUDevice, len(gs.Device)),
+	}
+	for id, dev := range gs.Device {
+		newDev := &GPUDevice{
+			ID:       dev.ID,
+			Node:     dev.Node,
+			UUID:     dev.UUID,
+			Memory:   dev.Memory,
+			Number:   dev.Number,
+			Type:     dev.Type,
+			Health:   dev.Health,
+			UsedNum:  dev.UsedNum,
+			UsedMem:  dev.UsedMem,
+			UsedCore: dev.UsedCore,
+			MigUsage: deepCopyMigInUse(dev.MigUsage),
+			PodMap:   make(map[string]*GPUUsage, len(dev.PodMap)),
+		}
+		if len(dev.MigTemplate) > 0 {
+			newDev.MigTemplate = make([]deviceconfig.Geometry, len(dev.MigTemplate))
+			for i, g := range dev.MigTemplate {
+				ng := deviceconfig.Geometry{
+					Group:     g.Group,
+					Instances: make([]deviceconfig.MigTemplate, len(g.Instances)),
+				}
+				copy(ng.Instances, g.Instances)
+				newDev.MigTemplate[i] = ng
 			}
 		}
-
-		annotations := make(map[string]string)
-		annotations[AssignedNodeAnnotations] = gs.Name
-		annotations[AssignedTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
-		annotations[AssignedIDsAnnotations] = encodePodDevices(device)
-		annotations[AssignedIDsToAllocateAnnotations] = annotations[AssignedIDsAnnotations]
-
-		annotations[DeviceBindPhase] = "allocating"
-		annotations[BindTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
-		// To avoid that the pod allocated info updating latency, add it first
-		gs.addResource(annotations, pod)
-		err = patchPodAnnotations(kubeClient, pod, annotations)
-		if err != nil {
-			return err
+		for uid, usage := range dev.PodMap {
+			u := *usage
+			newDev.PodMap[uid] = &u
 		}
-
-		klog.V(3).Infoln("DeviceSharing:Allocate Success")
+		cp.Device[id] = newDev
 	}
-	return nil
+	return cp
 }

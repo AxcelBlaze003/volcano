@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -43,6 +45,8 @@ import (
 )
 
 const (
+	// Namespace pod namespace
+	Namespace string = "Namespace"
 	// Name pod name
 	Name string = "Name"
 	// Ready pod ready
@@ -78,8 +82,8 @@ func InitListFlags(cmd *cobra.Command) {
 
 	cmd.Flags().StringVarP(&listPodFlags.QueueName, "queue", "q", "", "list pod with specified queue name")
 	cmd.Flags().StringVarP(&listPodFlags.JobName, "job", "j", "", "list pod with specified job name")
-	cmd.Flags().StringVarP(&listPodFlags.Namespace, "namespace", "n", "default", "the namespace of job")
-	cmd.Flags().BoolVarP(&listPodFlags.allNamespace, "all-namespaces", "", false, "list jobs in all namespaces")
+	cmd.Flags().StringVarP(&listPodFlags.Namespace, "namespace", "n", "default", "the namespace of pod")
+	cmd.Flags().BoolVarP(&listPodFlags.allNamespace, "all-namespaces", "", false, "list pods in all namespaces")
 }
 
 // ListPods lists all pods details created by vcjob
@@ -109,7 +113,7 @@ func ListPods(ctx context.Context) error {
 		pods.Items = append(pods.Items, listVcjobPodsRes.Items...)
 		if listPodFlags.QueueName != "" {
 			// if queue is specified, check if the queue name used by the pod matches with the one passed in
-			if !matchPodsLabel(listVcjobPodsRes, v1alpha1.QueueNameKey, listPodFlags.QueueName) {
+			if !matchPodsQueueReference(listVcjobPodsRes, listPodFlags.QueueName) {
 				return fmt.Errorf("the input vcjob %s does not match the queue %s",
 					listPodFlags.JobName, listPodFlags.QueueName)
 			}
@@ -124,7 +128,7 @@ func ListPods(ctx context.Context) error {
 			return err
 		}
 		// then, filter all vcjobs's pods belong to the queue
-		listVcJobPodsRes := filterPodsByLabel(listAllPodsRes, v1alpha1.QueueNameKey, listPodFlags.QueueName)
+		listVcJobPodsRes := filterPodsByQueueReference(listAllPodsRes, listPodFlags.QueueName)
 
 		// then, filter all other workload pods belong to the queue
 		listNormalPodsRes := filterPodsByAnnotation(listAllPodsRes, schedulingv1beta1.QueueNameAnnotationKey, listPodFlags.QueueName)
@@ -150,67 +154,95 @@ func ListPods(ctx context.Context) error {
 		fmt.Printf("No resources found\n")
 		return nil
 	}
-	PrintPods(&pods, os.Stdout)
+	sortPods(pods.Items)
+	PrintPods(&pods, os.Stdout, listPodFlags.allNamespace)
 
 	return nil
 }
 
-func PrintPods(pods *corev1.PodList, writer io.Writer) {
-	maxNameLen := 0
-	maxReadyLen := 0
-	maxStatusLen := 0
-	maxRestartLen := 0
-	maxAgeLen := 0
+type podColumn struct {
+	header string
+	value  func(PodInfo) string
+}
+
+func PrintPods(pods *corev1.PodList, writer io.Writer, showNamespace bool) {
+	var columns []podColumn
+	if showNamespace {
+		columns = append(columns, podColumn{Namespace, func(p PodInfo) string { return p.Namespace }})
+	}
+	columns = append(columns,
+		podColumn{Name, func(p PodInfo) string { return p.Name }},
+		podColumn{Ready, func(p PodInfo) string { return p.ReadyContainers }},
+		podColumn{Status, func(p PodInfo) string { return p.Status }},
+		podColumn{Restart, func(p PodInfo) string { return p.Restarts }},
+		podColumn{Age, func(p PodInfo) string { return p.CreationTimestamp }},
+	)
 
 	var infoList []PodInfo
-	for _, pod := range pods.Items {
-		info := printPod(&pod)
-		infoList = append(infoList, info)
-		// update max length for each column
-		if len(info.Name) > maxNameLen {
-			maxNameLen = len(info.Name)
-		}
-		if len(info.ReadyContainers) > maxReadyLen {
-			maxReadyLen = len(info.ReadyContainers)
-		}
-		if len(info.Status) > maxStatusLen {
-			maxStatusLen = len(info.Status)
-		}
-		if len(info.Restarts) > maxRestartLen {
-			maxRestartLen = len(info.Restarts)
-		}
-		if len(info.CreationTimestamp) > maxAgeLen {
-			maxAgeLen = len(info.CreationTimestamp)
+	for i := range pods.Items {
+		infoList = append(infoList, printPod(&pods.Items[i]))
+	}
+
+	// Size each column to fit its widest value plus a fixed spacing. When the
+	// header is wider than every value, fall back to the header length plus a
+	// smaller separator so the header never touches the next column (and so an
+	// empty list still renders a readable header row).
+	const (
+		columnSpacing = 8
+		headerSpacing = 2
+	)
+	widths := make([]int, len(columns))
+	for i, col := range columns {
+		widths[i] = len(col.header) + headerSpacing
+		for _, info := range infoList {
+			if l := len(col.value(info)) + columnSpacing; l > widths[i] {
+				widths[i] = l
+			}
 		}
 	}
-	columnSpacing := 8
-	maxNameLen += columnSpacing
-	maxReadyLen += columnSpacing
-	maxStatusLen += columnSpacing
-	maxRestartLen += columnSpacing
-	maxAgeLen += columnSpacing
-	formatStr := fmt.Sprintf("%%-%ds%%-%ds%%-%ds%%-%ds%%-%ds\n", maxNameLen, maxReadyLen, maxStatusLen, maxRestartLen, maxAgeLen)
-	_, err := fmt.Fprintf(writer, formatStr, Name, Ready, Status, Restart, Age)
-	if err != nil {
+
+	formatBuilder := make([]string, len(columns))
+	for i := range columns {
+		formatBuilder[i] = fmt.Sprintf("%%-%ds", widths[i])
+	}
+	formatStr := strings.Join(formatBuilder, "") + "\n"
+
+	headerArgs := make([]interface{}, len(columns))
+	for i, col := range columns {
+		headerArgs[i] = col.header
+	}
+	if _, err := fmt.Fprintf(writer, formatStr, headerArgs...); err != nil {
 		fmt.Printf("Failed to print Pod information: %s.\n", err)
 		return
 	}
 	for _, info := range infoList {
-		_, err := fmt.Fprintf(writer, formatStr, info.Name, info.ReadyContainers, info.Status, info.Restarts, info.CreationTimestamp)
-		if err != nil {
+		rowArgs := make([]interface{}, len(columns))
+		for i, col := range columns {
+			rowArgs[i] = col.value(info)
+		}
+		if _, err := fmt.Fprintf(writer, formatStr, rowArgs...); err != nil {
 			fmt.Printf("Failed to print Pod information: %s.\n", err)
 			return
 		}
 	}
 }
 
-// matchPodsLabel check if the pods match the labelKey and labelValue
-func matchPodsLabel(pods *corev1.PodList, labelKey, labelValue string) bool {
+// podQueueReference returns the canonical queue annotation, falling back to
+// the legacy label used by older Pods.
+func podQueueReference(pod corev1.Pod) (string, bool) {
+	if value, exists := pod.Annotations[schedulingv1beta1.QueueNameAnnotationKey]; exists && value != "" {
+		return value, true
+	}
+	value, exists := pod.Labels[v1alpha1.QueueNameKey]
+	return value, exists
+}
+
+// matchPodsQueueReference checks whether all Pods belong to the queue.
+func matchPodsQueueReference(pods *corev1.PodList, queueReference string) bool {
 	for _, pod := range pods.Items {
-		if value, exist := pod.Labels[labelKey]; exist {
-			if value != labelValue {
-				return false
-			}
+		value, exists := podQueueReference(pod)
+		if !exists || value != queueReference {
+			return false
 		}
 	}
 	return true
@@ -229,14 +261,14 @@ func filterPodsByAnnotation(pods *corev1.PodList, annotationKey, annotationValue
 	return filteredPods
 }
 
-// filterPodsByLabel filter pods based on labelKey and labelValue
-func filterPodsByLabel(pods *corev1.PodList, labelKey, labelValue string) *corev1.PodList {
+// filterPodsByQueueReference filters Pods by annotation, falling back to the
+// legacy queue label for older Pods.
+func filterPodsByQueueReference(pods *corev1.PodList, queueReference string) *corev1.PodList {
 	filteredPods := &corev1.PodList{}
 	for _, pod := range pods.Items {
-		if value, exist := pod.Labels[labelKey]; exist {
-			if value == labelValue {
-				filteredPods.Items = append(filteredPods.Items, pod)
-			}
+		value, exists := podQueueReference(pod)
+		if exists && value == queueReference {
+			filteredPods.Items = append(filteredPods.Items, pod)
 		}
 	}
 	return filteredPods
@@ -280,7 +312,7 @@ func appendIfNotExists(existing, toAppend []corev1.Pod) []corev1.Pod {
 	for _, pod := range toAppend {
 		exists := false
 		for _, existingPod := range existing {
-			if existingPod.Name == pod.Name {
+			if existingPod.Namespace == pod.Namespace && existingPod.Name == pod.Name {
 				exists = true
 				break
 			}
@@ -290,6 +322,18 @@ func appendIfNotExists(existing, toAppend []corev1.Pod) []corev1.Pod {
 		}
 	}
 	return existing
+}
+
+// sortPods orders the pods by namespace and name. The queue path merges two
+// filtered lists, so without this the rows can come out with the namespaces
+// interleaved rather than grouped.
+func sortPods(pods []corev1.Pod) {
+	sort.Slice(pods, func(i, j int) bool {
+		if pods[i].Namespace != pods[j].Namespace {
+			return pods[i].Namespace < pods[j].Namespace
+		}
+		return pods[i].Name < pods[j].Name
+	})
 }
 
 // translateTimestampSince translates a timestamp into a human-readable string using time.Since.
@@ -302,6 +346,7 @@ func translateTimestampSince(timestamp metav1.Time) string {
 
 // PodInfo holds information about a pod.
 type PodInfo struct {
+	Namespace         string
 	Name              string
 	ReadyContainers   string
 	Status            string
@@ -454,6 +499,7 @@ func printPod(pod *corev1.Pod) PodInfo {
 	}
 
 	podInfo := PodInfo{
+		Namespace:         pod.Namespace,
 		Name:              pod.Name,
 		ReadyContainers:   fmt.Sprintf("%d/%d", readyContainers, totalContainers),
 		Status:            reason,

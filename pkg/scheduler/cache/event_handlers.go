@@ -45,17 +45,20 @@ import (
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/topology"
-	volumeutil "k8s.io/kubernetes/pkg/volume/util"
+	kubeschedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/utils/cpuset"
 
 	nodeinfov1alpha1 "volcano.sh/apis/pkg/apis/nodeinfo/v1alpha1"
 	"volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/apis/pkg/apis/scheduling/scheme"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	nodeshardv1alpha1 "volcano.sh/apis/pkg/apis/shard/v1alpha1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	"volcano.sh/apis/pkg/apis/utils"
 	schedulingapi "volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
+	"volcano.sh/volcano/pkg/scheduler/unschedulable"
+	schedulercache "volcano.sh/volcano/pkg/schedulercommon/cache"
 )
 
 var DefaultAttachableVolumeQuantity int64 = math.MaxInt32
@@ -125,9 +128,17 @@ func (sc *SchedulerCache) getPodCSIVolumes(pod *v1.Pod) (map[v1.ResourceName]int
 
 		pvc, err := sc.pvcInformer.Lister().PersistentVolumeClaims(pod.Namespace).Get(pvcName)
 		if err != nil {
-			// The PVC is required to proceed with
-			// scheduling of a new pod because it cannot
-			// run without it. Bail out immediately.
+			// A PVC ADD event can reach the scheduler's PVC informer after
+			// the pod's ADD reaches the pod informer (e.g. a pod created
+			// together with an OnDemand PVC). When the PVC is simply not
+			// found yet, wrap the error in pendingPVCError so addPod adds
+			// the task to the cache and re-queues it for resync instead of
+			// dropping the pod. Any other lookup error is fatal as before.
+			if errors.IsNotFound(err) {
+				return volumes, &pendingPVCError{
+					err: fmt.Errorf("looking up PVC %s/%s: %w", pod.Namespace, pvcName, err),
+				}
+			}
 			return volumes, fmt.Errorf("looking up PVC %s/%s: %v", pod.Namespace, pvcName, err)
 		}
 		// The PVC for an ephemeral volume must be owned by the pod.
@@ -151,7 +162,7 @@ func (sc *SchedulerCache) getPodCSIVolumes(pod *v1.Pod) (map[v1.ResourceName]int
 		// the cache set up, in this case it is very difficult to refresh all task caches.
 		// For unattachable volume, set the limits number to a very large value, in this way, scheduling will never
 		// be limited due to insufficient quantity of it.
-		k := v1.ResourceName(volumeutil.GetCSIAttachLimitKey(driverName))
+		k := csiAttachLimitResourceName(driverName)
 		if _, ok := volumes[k]; !ok {
 			volumes[k] = 1
 		} else {
@@ -236,6 +247,9 @@ func (sc *SchedulerCache) addTask(pi *schedulingapi.TaskInfo) error {
 	job := sc.getOrCreateJob(pi)
 	if job != nil {
 		job.AddTaskInfo(pi)
+		if pi.OccupiesTopologyDomain() {
+			job.TaskPlacementGeneration++
+		}
 	}
 
 	return nil
@@ -246,8 +260,16 @@ func (sc *SchedulerCache) NewTaskInfo(pod *v1.Pod) (*schedulingapi.TaskInfo, err
 	if err := sc.addPodCSIVolumesToTask(taskInfo); err != nil {
 		return taskInfo, err
 	}
-	// Update BestEffort because the InitResreq maybe changes
-	taskInfo.BestEffort = taskInfo.InitResreq.IsEmpty()
+	// Adding CSI attachment counts updates both Resreq and InitResreq, which share an object here.
+	// Refresh BestEffort so a task with these requests is no longer treated as resource-free.
+	taskInfo.UpdateSchedulingBestEffort()
+	draResreq, claimDRAResreq, claimKeys, err := sc.buildTaskDRAInfo(pod)
+	if err != nil {
+		return taskInfo, err
+	}
+	taskInfo.DRAResreq = draResreq
+	taskInfo.ResourceClaimDRAResreq = claimDRAResreq
+	taskInfo.ResourceClaimKeys = claimKeys
 	return taskInfo, nil
 }
 
@@ -255,8 +277,33 @@ func (sc *SchedulerCache) NewTaskInfo(pod *v1.Pod) (*schedulingapi.TaskInfo, err
 func (sc *SchedulerCache) addPod(pod *v1.Pod) error {
 	pi, err := sc.NewTaskInfo(pod)
 	if err != nil {
+		if isPendingDRAResourceClaimError(err) {
+			klog.V(4).Infof("DRA ResourceClaim for pod <%s/%s> is not ready, add task to cache and retry: %v", pod.Namespace, pod.Name, err)
+			if addErr := sc.addTask(pi); addErr != nil {
+				return addErr
+			}
+			sc.resyncTask(pi)
+			return nil
+		}
+		// Recover from a Pod ADD that races ahead of its PVC ADD on the
+		// informers: the referenced PVC is not yet in the scheduler's PVC
+		// informer. Add the task to the cache and enqueue it for resync so
+		// syncTask re-fetches the pod once the PVC syncs, rather than
+		// dropping it (resyncTask on a task never added to sc.Jobs would be
+		// Forgotten by processResyncTask and lost). Same pattern as the DRA
+		// branch above. Only PVC-not-found is recovered here; other errors
+		// fall through to the drop path below.
+		if isPendingPVCError(err) {
+			klog.V(4).Infof("PVC for pod <%s/%s> not yet in informer cache, add task and retry: %v", pod.Namespace, pod.Name, err)
+			if addErr := sc.addTask(pi); addErr != nil {
+				return addErr
+			}
+			sc.resyncTask(pi)
+			return nil
+		}
 		klog.Errorf("generate taskInfo for pod(%s) failed: %v", pod.Name, err)
 		sc.resyncTask(pi)
+		return err
 	}
 
 	return sc.addTask(pi)
@@ -268,6 +315,7 @@ func (sc *SchedulerCache) syncTask(oldTask *schedulingapi.TaskInfo) error {
 		if errors.IsNotFound(err) {
 			sc.Mutex.Lock()
 			defer sc.Mutex.Unlock()
+			sc.clearUnassignedNumaTask(oldTask)
 			err := sc.deleteTask(oldTask)
 			if err != nil {
 				klog.Errorf("Failed to delete Pod <%v/%v> and remove from cache: %s", oldTask.Namespace, oldTask.Name, err.Error())
@@ -319,6 +367,14 @@ func (sc *SchedulerCache) updatePod(oldPod, newPod *v1.Pod) error {
 		return nil
 	}
 
+	oldTask := schedulingapi.NewTaskInfo(oldPod)
+	var placementGeneration uint64
+	if job := sc.Jobs[oldTask.Job]; job != nil {
+		placementGeneration = job.TaskPlacementGeneration
+		if cached := job.Tasks[oldTask.UID]; cached != nil {
+			oldTask = cached
+		}
+	}
 	if err := sc.deletePod(oldPod); err != nil {
 		return err
 	}
@@ -326,15 +382,41 @@ func (sc *SchedulerCache) updatePod(oldPod, newPod *v1.Pod) error {
 	if len(utils.GetController(newPod)) == 0 {
 		newPod.OwnerReferences = oldPod.OwnerReferences
 	}
-	return sc.addPod(newPod)
+	if err := sc.addPod(newPod); err != nil {
+		return err
+	}
+	newTask := schedulingapi.NewTaskInfo(newPod)
+	if job := sc.Jobs[newTask.Job]; job != nil && oldTask.Job == newTask.Job && oldTask.UID == newTask.UID {
+		// delete/add is an implementation detail of a Pod update. Coalesce it
+		// when neither occupied Node nor SubJob membership can have changed.
+		if oldTask.NodeName == newTask.NodeName && oldTask.OccupiesTopologyDomain() == newTask.OccupiesTopologyDomain() &&
+			oldTask.TaskRole == newTask.TaskRole && reflect.DeepEqual(oldTask.Pod.Labels, newPod.Labels) {
+			job.TaskPlacementGeneration = placementGeneration
+		}
+	}
+	return nil
+}
+
+func (sc *SchedulerCache) clearUnassignedNumaTask(ti *schedulingapi.TaskInfo) {
+	if len(ti.NodeName) != 0 {
+		node := sc.Nodes[ti.NodeName]
+		if node != nil {
+			podMeta := schedulingapi.PodMeta{UID: ti.Pod.UID, Name: ti.Pod.Name, Namespace: ti.Pod.Namespace}
+			if resSets, ok := node.UnassignedNumaPods[podMeta]; ok {
+				delete(node.UnassignedNumaPods, podMeta)
+				klog.V(3).Infof("deleted unassigned pod %v with resourceSet %v on node %s", podMeta, resSets, node.Name)
+			}
+		}
+	}
 }
 
 func (sc *SchedulerCache) deleteTask(ti *schedulingapi.TaskInfo) error {
-	var jobErr, nodeErr error
-
 	if len(ti.Job) != 0 {
 		if job, found := sc.Jobs[ti.Job]; found {
-			jobErr = job.DeleteTaskInfo(ti)
+			job.DeleteTaskInfo(ti)
+			if ti.OccupiesTopologyDomain() {
+				job.TaskPlacementGeneration++
+			}
 		} else {
 			klog.Warningf("Failed to find Job <%v> for Task <%v/%v> in cache.", ti.Job, ti.Namespace, ti.Name)
 		}
@@ -350,16 +432,25 @@ func (sc *SchedulerCache) deleteTask(ti *schedulingapi.TaskInfo) error {
 		if !isTerminated(ti.Status) {
 			node := sc.Nodes[ti.NodeName]
 			if node != nil {
-				nodeErr = node.RemoveTask(ti)
+				node.RemoveTask(ti)
 			}
 		}
 	}
 
-	if jobErr != nil || nodeErr != nil {
-		return schedulingapi.MergeErrors(jobErr, nodeErr)
+	return nil
+}
+
+func (sc *SchedulerCache) clearUnassignedNumaPod(pod *v1.Pod) {
+	pi := schedulingapi.NewTaskInfo(pod)
+
+	task := pi
+	if job, found := sc.Jobs[pi.Job]; found {
+		if t, found := job.Tasks[pi.UID]; found {
+			task = t
+		}
 	}
 
-	return nil
+	sc.clearUnassignedNumaTask(task)
 }
 
 // Assumes that lock is already acquired.
@@ -386,6 +477,80 @@ func (sc *SchedulerCache) deletePod(pod *v1.Pod) error {
 	return nil
 }
 
+func unschedulableJobIDForPod(pod *v1.Pod) (schedulingapi.JobID, bool) {
+	if pod == nil {
+		return "", false
+	}
+	groupName := pod.Annotations[schedulingv1beta1.KubeGroupNameAnnotationKey]
+	if groupName == "" {
+		return "", false
+	}
+	return schedulingapi.JobID(fmt.Sprintf("%s/%s", pod.Namespace, groupName)), true
+}
+
+func (sc *SchedulerCache) invalidateUnschedulableJobForPod(pod *v1.Pod) {
+	if sc.unschedulableJobCache == nil {
+		return
+	}
+	if jobID, ok := unschedulableJobIDForPod(pod); ok {
+		sc.unschedulableJobCache.Invalidate(jobID)
+	}
+}
+
+// invalidateUnschedulableJobsForPodUpdate removes cached results when a Pod
+// moves between Jobs or changes scheduling inputs within the same Job.
+func (sc *SchedulerCache) invalidateUnschedulableJobsForPodUpdate(oldPod, newPod *v1.Pod, schedulingInputsChanged bool) {
+	oldJobID, oldHasJob := unschedulableJobIDForPod(oldPod)
+	newJobID, newHasJob := unschedulableJobIDForPod(newPod)
+	jobAssignmentChanged := oldHasJob != newHasJob || oldJobID != newJobID
+	if jobAssignmentChanged {
+		if oldHasJob {
+			sc.unschedulableJobCache.Invalidate(oldJobID)
+		}
+		if newHasJob {
+			sc.unschedulableJobCache.Invalidate(newJobID)
+		}
+		return
+	}
+	if schedulingInputsChanged && newHasJob {
+		sc.unschedulableJobCache.Invalidate(newJobID)
+	}
+}
+
+// handleUnschedulableJobCachePodUpdate invalidates cached scheduling results
+// affected by the Pod update and dispatches the corresponding scheduling events.
+func (sc *SchedulerCache) handleUnschedulableJobCachePodUpdate(oldPod, newPod *v1.Pod) {
+	if sc.unschedulableJobCache == nil {
+		return
+	}
+
+	// A terminal Pod releases all of its node resources, so dispatch it as a
+	// Delete event to subscribers that react to resource release.
+	terminalRelease := !schedulingapi.CompletedStatus(schedulingapi.GetTaskStatus(oldPod)) &&
+		schedulingapi.CompletedStatus(schedulingapi.GetTaskStatus(newPod))
+	podBecameAssigned := oldPod.Spec.NodeName == "" && newPod.Spec.NodeName != ""
+	events := kubeschedulerframework.PodSchedulingPropertiesChange(newPod, oldPod, false)
+	schedulingInputsChanged := terminalRelease || podBecameAssigned || slices.ContainsFunc(events, func(event fwk.ClusterEvent) bool {
+		// A larger request cannot relax a cached rejection.
+		return event.ActionType != fwk.Update && event.ActionType != fwk.UpdatePodScaleUp
+	})
+	sc.invalidateUnschedulableJobsForPodUpdate(oldPod, newPod, schedulingInputsChanged)
+
+	if terminalRelease {
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: fwk.Pod, ActionType: fwk.Delete}, oldPod, nil)
+		return
+	}
+	if podBecameAssigned {
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: fwk.Pod, ActionType: fwk.Add}, nil, newPod)
+	}
+	for _, event := range events {
+		if podBecameAssigned && event.ActionType == fwk.Update {
+			continue
+		}
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: fwk.Pod, ActionType: event.ActionType}, oldPod, newPod)
+	}
+}
+
 // AddPod add pod to scheduler cache
 func (sc *SchedulerCache) AddPod(obj interface{}) {
 	pod, ok := obj.(*v1.Pod)
@@ -395,13 +560,19 @@ func (sc *SchedulerCache) AddPod(obj interface{}) {
 	}
 
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
-
 	err := sc.addPod(pod)
+	sc.Mutex.Unlock()
 	if err != nil {
 		klog.Errorf("Failed to add pod <%s/%s> into cache: %v",
 			pod.Namespace, pod.Name, err)
 		return
+	}
+	if pod.Spec.NodeName == "" {
+		metrics.UpdateTaskScheduleDuration(metrics.TaskStageWatched, metrics.Duration(pod.CreationTimestamp.Time))
+	}
+	if sc.unschedulableJobCache != nil {
+		sc.invalidateUnschedulableJobForPod(pod)
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: fwk.Pod, ActionType: fwk.Add}, nil, pod)
 	}
 	klog.V(3).Infof("Added pod <%s/%v> into cache.", pod.Namespace, pod.Name)
 }
@@ -420,14 +591,14 @@ func (sc *SchedulerCache) UpdatePod(oldObj, newObj interface{}) {
 	}
 
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
-
 	err := sc.updatePod(oldPod, newPod)
+	sc.Mutex.Unlock()
 	if err != nil {
 		klog.Errorf("Failed to update pod %v in cache: %v", oldPod.Name, err)
 		return
 	}
 
+	sc.handleUnschedulableJobCachePodUpdate(oldPod, newPod)
 	klog.V(4).Infof("Updated pod <%s/%v> in cache.", oldPod.Namespace, oldPod.Name)
 }
 
@@ -450,14 +621,18 @@ func (sc *SchedulerCache) DeletePod(obj interface{}) {
 	}
 
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
-
+	sc.clearUnassignedNumaPod(pod)
 	err := sc.deletePod(pod)
+	sc.Mutex.Unlock()
 	if err != nil {
 		klog.Errorf("Failed to delete pod %v from cache: %v", pod.Name, err)
 		return
 	}
 
+	if sc.unschedulableJobCache != nil {
+		sc.invalidateUnschedulableJobForPod(pod)
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: fwk.Pod, ActionType: fwk.Delete}, pod, nil)
+	}
 	klog.V(3).Infof("Deleted pod <%s/%v> from cache.", pod.Namespace, pod.Name)
 }
 
@@ -559,14 +734,18 @@ func (sc *SchedulerCache) RemoveNode(nodeName string) error {
 }
 
 // AddNode add node to scheduler cache
-func (sc *SchedulerCache) AddNode(obj interface{}) {
+func (sc *SchedulerCache) AddNode(obj interface{}, isInInitialList bool) {
 	node, ok := obj.(*v1.Node)
 	if !ok {
 		klog.Errorf("Cannot convert to *v1.Node: %v", obj)
 		return
 	}
-	sc.nodeQueue.Add(node.Name)
-	sc.hyperNodesQueue.Add(string(hyperNodeEventSourceNode) + "/" + node.Name)
+	sc.nodeQueue.Add(schedulercache.QueueObjectWrapper{Object: node.Name, IsInInitialList: isInInitialList})
+	sc.hyperNodesQueue.Add(schedulercache.QueueObjectWrapper{Object: string(hyperNodeEventSourceNode) + "/" + node.Name, IsInInitialList: isInInitialList})
+	if isInInitialList {
+		sc.nodeInitialEventTracker.Add(node.Name)
+		sc.hyperNodesInitialEventTracker.Add(string(hyperNodeEventSourceNode) + "/" + node.Name)
+	}
 }
 
 // UpdateNode update node to scheduler cache
@@ -581,9 +760,9 @@ func (sc *SchedulerCache) UpdateNode(oldObj, newObj interface{}) {
 		klog.Errorf("Cannot convert newObj to *v1.Node: %v", newObj)
 		return
 	}
-	sc.nodeQueue.Add(newNode.Name)
+	sc.nodeQueue.Add(schedulercache.QueueObjectWrapper{Object: newNode.Name, IsInInitialList: false})
 	if !reflect.DeepEqual(oldNode.GetLabels(), newNode.GetLabels()) {
-		sc.hyperNodesQueue.Add(string(hyperNodeEventSourceNode) + "/" + newNode.Name)
+		sc.hyperNodesQueue.Add(schedulercache.QueueObjectWrapper{Object: string(hyperNodeEventSourceNode) + "/" + newNode.Name, IsInInitialList: false})
 	}
 }
 
@@ -604,14 +783,31 @@ func (sc *SchedulerCache) DeleteNode(obj interface{}) {
 		klog.Errorf("Cannot convert to *v1.Node: %v", t)
 		return
 	}
-	sc.nodeQueue.Add(node.Name)
-	sc.hyperNodesQueue.Add(string(hyperNodeEventSourceNode) + "/" + node.Name)
+	sc.nodeQueue.Add(schedulercache.QueueObjectWrapper{Object: node.Name, IsInInitialList: false})
+	sc.hyperNodesQueue.Add(schedulercache.QueueObjectWrapper{Object: string(hyperNodeEventSourceNode) + "/" + node.Name, IsInInitialList: false})
+}
+
+// nodeObject returns the cached Node pointer under the cache lock. Callers must
+// treat it as read-only. NodeInfo.SetNode replaces this pointer instead of
+// mutating the old object, so it remains a stable oldObj for QueueingHints after
+// the cache entry is updated or removed.
+func (sc *SchedulerCache) nodeObject(nodeName string) *v1.Node {
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+	if nodeInfo := sc.Nodes[nodeName]; nodeInfo != nil {
+		return nodeInfo.Node
+	}
+	return nil
 }
 
 func (sc *SchedulerCache) SyncNode(nodeName string) error {
 	node, err := sc.nodeInformer.Lister().Get(nodeName)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			var oldNode *v1.Node
+			if sc.unschedulableJobCache != nil {
+				oldNode = sc.nodeObject(nodeName)
+			}
 			deleteErr := sc.RemoveNode(nodeName)
 			if deleteErr != nil {
 				klog.Errorf("Failed to delete node <%s> and remove from cache: %s", nodeName, deleteErr.Error())
@@ -619,6 +815,9 @@ func (sc *SchedulerCache) SyncNode(nodeName string) error {
 			}
 
 			klog.V(3).Infof("Node <%s> was deleted, removed from cache.", nodeName)
+			if sc.unschedulableJobCache != nil && oldNode != nil {
+				sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: fwk.Node, ActionType: fwk.Delete}, oldNode, nil)
+			}
 			return nil
 		}
 		klog.Errorf("Failed to get node %s, error: %v", nodeName, err)
@@ -628,6 +827,10 @@ func (sc *SchedulerCache) SyncNode(nodeName string) error {
 	if !sc.nodeCanAddCache(node) {
 		return nil
 	}
+	var oldNode *v1.Node
+	if sc.unschedulableJobCache != nil {
+		oldNode = sc.nodeObject(nodeName)
+	}
 	nodeCopy := node.DeepCopy()
 	csiNode, err := sc.csiNodeInformer.Lister().Get(nodeName)
 	if err == nil {
@@ -635,7 +838,20 @@ func (sc *SchedulerCache) SyncNode(nodeName string) error {
 	} else if !errors.IsNotFound(err) {
 		return err
 	}
-	return sc.AddOrUpdateNode(nodeCopy)
+	if err := sc.AddOrUpdateNode(nodeCopy); err != nil {
+		return err
+	}
+	if sc.unschedulableJobCache == nil {
+		return nil
+	}
+	if oldNode == nil {
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: fwk.Node, ActionType: fwk.Add}, nil, nodeCopy)
+		return nil
+	}
+	for _, event := range kubeschedulerframework.NodeSchedulingPropertiesChange(nodeCopy, oldNode) {
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: fwk.Node, ActionType: event.ActionType}, oldNode, nodeCopy)
+	}
+	return nil
 }
 
 func (sc *SchedulerCache) nodeCanAddCache(node *v1.Node) bool {
@@ -655,7 +871,7 @@ func (sc *SchedulerCache) nodeCanAddCache(node *v1.Node) bool {
 	return false
 }
 
-func (sc *SchedulerCache) AddOrUpdateCSINode(obj interface{}) {
+func (sc *SchedulerCache) AddOrUpdateCSINode(obj interface{}, isInInitialList bool) {
 	csiNode, ok := obj.(*sv1.CSINode)
 	if !ok {
 		return
@@ -673,7 +889,11 @@ func (sc *SchedulerCache) AddOrUpdateCSINode(obj interface{}) {
 		csiNodeStatus.DriverStatus[d.Name] = d.Allocatable != nil && d.Allocatable.Count != nil
 	}
 	sc.CSINodesStatus[csiNode.Name] = csiNodeStatus
-	sc.nodeQueue.Add(csiNode.Name)
+	if isInInitialList {
+		//track the obj handling from initial list
+		sc.nodeInitialEventTracker.Add(csiNode.Name)
+	}
+	sc.nodeQueue.Add(schedulercache.QueueObjectWrapper{Object: csiNode.Name, IsInInitialList: isInInitialList})
 }
 
 func (sc *SchedulerCache) UpdateCSINode(oldObj, newObj interface{}) {
@@ -688,7 +908,7 @@ func (sc *SchedulerCache) UpdateCSINode(oldObj, newObj interface{}) {
 	if equality.Semantic.DeepEqual(oldCSINode.Spec, newCSINode.Spec) {
 		return
 	}
-	sc.AddOrUpdateCSINode(newObj)
+	sc.AddOrUpdateCSINode(newObj, false)
 }
 
 func (sc *SchedulerCache) DeleteCSINode(obj interface{}) {
@@ -711,7 +931,7 @@ func (sc *SchedulerCache) DeleteCSINode(obj interface{}) {
 	sc.Mutex.Lock()
 	delete(sc.CSINodesStatus, csiNode.Name)
 	sc.Mutex.Unlock()
-	sc.nodeQueue.Add(csiNode.Name)
+	sc.nodeQueue.Add(schedulercache.QueueObjectWrapper{Object: csiNode.Name, IsInInitialList: false})
 }
 
 func (sc *SchedulerCache) SyncHyperNode(name string) error {
@@ -742,6 +962,7 @@ func (sc *SchedulerCache) triggerUpdateHyperNode(name string) error {
 		klog.V(3).InfoS("No need to update hyperNode cache when node added or deleted")
 		return nil
 	}
+	resolvedNodesBeforeUpdate := sc.HyperNodesInfo.RealNodesSet()
 
 	for leafNode := range leafNodes {
 		hn := sc.HyperNodesInfo.HyperNode(leafNode)
@@ -754,7 +975,12 @@ func (sc *SchedulerCache) triggerUpdateHyperNode(name string) error {
 			klog.ErrorS(err, "Failed to get node regex match leaf hyperNode", "nodeName", name, "hyperNodeName", hn.Name)
 			continue
 		}
-		if !match {
+		// Rebuild both newly matching HyperNodes and HyperNodes that contained
+		// the Node before this event. The latter is required when a label update
+		// moves a Node out of a label selector, or when a deleted Node can no
+		// longer be read from the informer lister.
+		wasMember := resolvedNodesBeforeUpdate[leafNode].Has(name)
+		if !match && !wasMember {
 			continue
 		}
 
@@ -786,17 +1012,17 @@ func getJobID(pg *schedulingapi.PodGroup) schedulingapi.JobID {
 
 // Assumes that lock is already acquired.
 func (sc *SchedulerCache) setPodGroup(ss *schedulingapi.PodGroup) error {
+	queueID, err := resolveQueueReference(ss.Namespace, ss.Spec.Queue, sc.defaultQueue)
+	if err != nil {
+		return err
+	}
 	job := getJobID(ss)
 	if _, found := sc.Jobs[job]; !found {
 		sc.Jobs[job] = schedulingapi.NewJobInfo(job)
 	}
 
 	sc.Jobs[job].SetPodGroup(ss)
-
-	// TODO(k82cn): set default queue in admission.
-	if len(ss.Spec.Queue) == 0 {
-		sc.Jobs[job].Queue = schedulingapi.QueueID(sc.defaultQueue)
-	}
+	sc.Jobs[job].Queue = queueID
 
 	metrics.UpdateE2eSchedulingStartTimeByJob(sc.Jobs[job].Name, string(sc.Jobs[job].Queue), sc.Jobs[job].Namespace,
 		sc.Jobs[job].CreationTimestamp.Time)
@@ -806,6 +1032,34 @@ func (sc *SchedulerCache) setPodGroup(ss *schedulingapi.PodGroup) error {
 // Assumes that lock is already acquired.
 func (sc *SchedulerCache) updatePodGroup(newPodGroup *schedulingapi.PodGroup) error {
 	return sc.setPodGroup(newPodGroup)
+}
+
+// podGroupSchedulingInputsChanged returns true when a PodGroup update can
+// change scheduling. JobAllocatedHyperNode is ignored because it is scheduler
+// output rather than scheduling input.
+func podGroupSchedulingInputsChanged(oldPodGroup, newPodGroup *schedulingv1beta1.PodGroup) bool {
+	if !equality.Semantic.DeepEqual(oldPodGroup.Spec, newPodGroup.Spec) ||
+		!equality.Semantic.DeepEqual(oldPodGroup.Labels, newPodGroup.Labels) {
+		return true
+	}
+
+	for key, oldValue := range oldPodGroup.Annotations {
+		if key == schedulingapi.JobAllocatedHyperNode {
+			continue
+		}
+		if newValue, found := newPodGroup.Annotations[key]; !found || newValue != oldValue {
+			return true
+		}
+	}
+	for key := range newPodGroup.Annotations {
+		if key == schedulingapi.JobAllocatedHyperNode {
+			continue
+		}
+		if _, found := oldPodGroup.Annotations[key]; !found {
+			return true
+		}
+	}
+	return false
 }
 
 // Assumes that lock is already acquired.
@@ -843,11 +1097,14 @@ func (sc *SchedulerCache) AddPodGroupV1beta1(obj interface{}) {
 	klog.V(4).Infof("Add PodGroup(%s) into cache, spec(%#v)", ss.Name, ss.Spec)
 
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
-
-	if err := sc.setPodGroup(pg); err != nil {
+	err := sc.setPodGroup(pg)
+	sc.Mutex.Unlock()
+	if err != nil {
 		klog.Errorf("Failed to add PodGroup %s into cache: %v", ss.Name, err)
 		return
+	}
+	if sc.unschedulableJobCache != nil {
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: unschedulable.PodGroupEvent, ActionType: fwk.Add}, nil, pg)
 	}
 }
 
@@ -867,6 +1124,8 @@ func (sc *SchedulerCache) UpdatePodGroupV1beta1(oldObj, newObj interface{}) {
 	if oldSS.ResourceVersion == newSS.ResourceVersion {
 		return
 	}
+	cacheEnabled := sc.unschedulableJobCache != nil
+	schedulingInputsChanged := cacheEnabled && podGroupSchedulingInputsChanged(oldSS, newSS)
 
 	podgroup := scheduling.PodGroup{}
 	if err := scheme.Scheme.Convert(newSS, &podgroup, nil); err != nil {
@@ -879,12 +1138,25 @@ func (sc *SchedulerCache) UpdatePodGroupV1beta1(oldObj, newObj interface{}) {
 	pg := &schedulingapi.PodGroup{PodGroup: podgroup, Version: schedulingapi.PodGroupVersionV1Beta1}
 
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
-
-	if err := sc.updatePodGroup(pg); err != nil {
+	err := sc.updatePodGroup(pg)
+	sc.Mutex.Unlock()
+	if err != nil {
 		klog.Errorf("Failed to update SchedulingSpec %s into cache: %v", pg.Name, err)
 		return
 	}
+	if !cacheEnabled {
+		return
+	}
+	if schedulingInputsChanged {
+		jobID := schedulingapi.JobID(fmt.Sprintf("%s/%s", newSS.Namespace, newSS.Name))
+		sc.unschedulableJobCache.Invalidate(jobID)
+	}
+	oldPg := &schedulingapi.PodGroup{Version: schedulingapi.PodGroupVersionV1Beta1}
+	oldConverted := scheduling.PodGroup{}
+	if err := scheme.Scheme.Convert(oldSS, &oldConverted, nil); err == nil {
+		oldPg.PodGroup = oldConverted
+	}
+	sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: unschedulable.PodGroupEvent, ActionType: fwk.Update}, oldPg, pg)
 }
 
 // DeletePodGroupV1beta1 delete podgroup from scheduler cache
@@ -906,14 +1178,25 @@ func (sc *SchedulerCache) DeletePodGroupV1beta1(obj interface{}) {
 	}
 
 	jobID := schedulingapi.JobID(fmt.Sprintf("%s/%s", ss.Namespace, ss.Name))
-
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
-
-	if err := sc.deletePodGroup(jobID); err != nil {
+	err := sc.deletePodGroup(jobID)
+	sc.Mutex.Unlock()
+	if err != nil {
 		klog.Errorf("Failed to delete podgroup %s from cache: %v", ss.Name, err)
 		return
 	}
+	if sc.unschedulableJobCache == nil {
+		return
+	}
+	sc.unschedulableJobCache.Invalidate(jobID)
+
+	podgroup := scheduling.PodGroup{}
+	if err := scheme.Scheme.Convert(ss, &podgroup, nil); err != nil {
+		klog.Errorf("Failed to convert podgroup from %T to %T", ss, podgroup)
+		return
+	}
+	pg := &schedulingapi.PodGroup{PodGroup: podgroup, Version: schedulingapi.PodGroupVersionV1Beta1}
+	sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: unschedulable.PodGroupEvent, ActionType: fwk.Delete}, pg, nil)
 }
 
 // AddQueueV1beta1 add queue to scheduler cache
@@ -931,10 +1214,12 @@ func (sc *SchedulerCache) AddQueueV1beta1(obj interface{}) {
 	}
 
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
-
 	klog.V(4).Infof("Add Queue(%s) into cache, spec(%#v)", ss.Name, ss.Spec)
 	sc.addQueue(queue)
+	sc.Mutex.Unlock()
+	if sc.unschedulableJobCache != nil {
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: unschedulable.QueueEvent, ActionType: fwk.Add}, nil, queue)
+	}
 }
 
 // UpdateQueueV1beta1 update queue to scheduler cache
@@ -959,10 +1244,21 @@ func (sc *SchedulerCache) UpdateQueueV1beta1(oldObj, newObj interface{}) {
 		klog.Errorf("Failed to convert queue from %T to %T", newSS, newQueue)
 		return
 	}
+	var oldQueue *scheduling.Queue
+	if sc.unschedulableJobCache != nil {
+		oldQueue = &scheduling.Queue{}
+		if err := scheme.Scheme.Convert(oldSS, oldQueue, nil); err != nil {
+			klog.Errorf("Failed to convert queue from %T to %T", oldSS, oldQueue)
+			return
+		}
+	}
 
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
 	sc.updateQueue(newQueue)
+	sc.Mutex.Unlock()
+	if sc.unschedulableJobCache != nil {
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: unschedulable.QueueEvent, ActionType: fwk.Update}, oldQueue, newQueue)
+	}
 }
 
 // DeleteQueueV1beta1 delete queue from the scheduler cache
@@ -984,8 +1280,16 @@ func (sc *SchedulerCache) DeleteQueueV1beta1(obj interface{}) {
 	}
 
 	sc.Mutex.Lock()
-	defer sc.Mutex.Unlock()
 	sc.deleteQueue(schedulingapi.QueueID(ss.Name))
+	sc.Mutex.Unlock()
+	if sc.unschedulableJobCache != nil {
+		queue := &scheduling.Queue{}
+		if err := scheme.Scheme.Convert(ss, queue, nil); err != nil {
+			klog.Errorf("Failed to convert queue from %T to %T", ss, queue)
+			return
+		}
+		sc.unschedulableJobCache.OnEvent(fwk.ClusterEvent{Resource: unschedulable.QueueEvent, ActionType: fwk.Delete}, queue, nil)
+	}
 }
 
 func (sc *SchedulerCache) addQueue(queue *scheduling.Queue) {
@@ -1000,8 +1304,60 @@ func (sc *SchedulerCache) updateQueue(queue *scheduling.Queue) {
 func (sc *SchedulerCache) deleteQueue(id schedulingapi.QueueID) {
 	if queue, ok := sc.Queues[id]; ok {
 		delete(sc.Queues, id)
-		metrics.DeleteQueueMetrics(queue.Name)
+		metrics.DeleteQueueMetrics(string(queue.UID))
 	}
+}
+
+func (sc *SchedulerCache) AddNamespaceQueueV1beta1(obj interface{}) {
+	queue, ok := obj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		klog.Errorf("Cannot convert to NamespaceQueue: %v", obj)
+		return
+	}
+	internal := &scheduling.NamespaceQueue{}
+	if err := scheme.Scheme.Convert(queue, internal, nil); err != nil {
+		klog.Errorf("Failed to convert NamespaceQueue %s/%s: %v", queue.Namespace, queue.Name, err)
+		return
+	}
+	info, err := schedulingapi.NewNamespaceQueueInfo(internal)
+	if err != nil {
+		klog.Errorf("Failed to build NamespaceQueueInfo %s/%s: %v", queue.Namespace, queue.Name, err)
+		return
+	}
+	sc.Mutex.Lock()
+	sc.Queues[info.UID] = info
+	sc.Mutex.Unlock()
+}
+
+func (sc *SchedulerCache) UpdateNamespaceQueueV1beta1(oldObj, newObj interface{}) {
+	oldQueue, ok := oldObj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		return
+	}
+	newQueue, ok := newObj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok || oldQueue.ResourceVersion == newQueue.ResourceVersion {
+		return
+	}
+	sc.AddNamespaceQueueV1beta1(newQueue)
+}
+
+func (sc *SchedulerCache) DeleteNamespaceQueueV1beta1(obj interface{}) {
+	var queue *schedulingv1beta1.NamespaceQueue
+	switch value := obj.(type) {
+	case *schedulingv1beta1.NamespaceQueue:
+		queue = value
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+		queue, ok = value.Obj.(*schedulingv1beta1.NamespaceQueue)
+		if !ok {
+			return
+		}
+	default:
+		return
+	}
+	sc.Mutex.Lock()
+	delete(sc.Queues, schedulingapi.NamespaceQueueID(queue.Namespace, queue.Name))
+	sc.Mutex.Unlock()
 }
 
 // DeletePriorityClass delete priorityclass from the scheduler cache
@@ -1165,12 +1521,13 @@ func (sc *SchedulerCache) AddResourceQuota(obj interface{}) {
 
 func getNumaInfo(srcInfo *nodeinfov1alpha1.Numatopology) *schedulingapi.NumatopoInfo {
 	numaInfo := &schedulingapi.NumatopoInfo{
-		Namespace:   srcInfo.Namespace,
-		Name:        srcInfo.Name,
-		Policies:    make(map[nodeinfov1alpha1.PolicyName]string),
-		NumaResMap:  make(map[string]*schedulingapi.ResourceInfo),
-		CPUDetail:   topology.CPUDetails{},
-		ResReserved: make(v1.ResourceList),
+		Namespace:      srcInfo.Namespace,
+		Name:           srcInfo.Name,
+		Policies:       make(map[nodeinfov1alpha1.PolicyName]string),
+		NumaResMap:     make(map[string]*schedulingapi.ResourceInfo),
+		CPUDetail:      topology.CPUDetails{},
+		ResReserved:    make(v1.ResourceList),
+		PodAllocations: make([]nodeinfov1alpha1.PodAllocation, 0, len(srcInfo.Spec.PodAllocations)),
 	}
 
 	policies := srcInfo.Spec.Policies
@@ -1207,6 +1564,11 @@ func getNumaInfo(srcInfo *nodeinfov1alpha1.Numatopology) *schedulingapi.Numatopo
 		numaInfo.ResReserved = resReserved
 	}
 
+	podAllocations := srcInfo.Spec.PodAllocations
+	for _, podAllocation := range podAllocations {
+		numaInfo.PodAllocations = append(numaInfo.PodAllocations, *podAllocation.DeepCopy())
+	}
+
 	return numaInfo
 }
 
@@ -1217,26 +1579,12 @@ func (sc *SchedulerCache) addNumaInfo(info *nodeinfov1alpha1.Numatopology) error
 		sc.Nodes[info.Name].Name = info.Name
 	}
 
-	if sc.Nodes[info.Name].NumaInfo == nil {
-		sc.Nodes[info.Name].NumaInfo = getNumaInfo(info)
-		sc.Nodes[info.Name].NumaChgFlag = schedulingapi.NumaInfoMoreFlag
-	} else {
-		newLocalInfo := getNumaInfo(info)
-		if sc.Nodes[info.Name].NumaInfo.Compare(newLocalInfo) {
-			sc.Nodes[info.Name].NumaChgFlag = schedulingapi.NumaInfoMoreFlag
-		} else {
-			sc.Nodes[info.Name].NumaChgFlag = schedulingapi.NumaInfoLessFlag
-		}
-
-		sc.Nodes[info.Name].NumaInfo = newLocalInfo
-	}
-
+	sc.Nodes[info.Name].NumaInfo = getNumaInfo(info)
 	for resName, NumaResInfo := range sc.Nodes[info.Name].NumaInfo.NumaResMap {
 		klog.V(3).Infof("resource %s Allocatable %v on node[%s] into cache", resName, NumaResInfo, info.Name)
 	}
-
-	klog.V(3).Infof("Policies %v on node[%s] into cache, change= %v",
-		sc.Nodes[info.Name].NumaInfo.Policies, info.Name, sc.Nodes[info.Name].NumaChgFlag)
+	klog.V(3).Infof("Policies %v on node[%s] into cache", sc.Nodes[info.Name].NumaInfo.Policies, info.Name)
+	klog.V(5).Infof("pod allocations %v on node[%s] into cache", sc.Nodes[info.Name].NumaInfo.PodAllocations, info.Name)
 	return nil
 }
 
@@ -1244,7 +1592,6 @@ func (sc *SchedulerCache) addNumaInfo(info *nodeinfov1alpha1.Numatopology) error
 func (sc *SchedulerCache) deleteNumaInfo(info *nodeinfov1alpha1.Numatopology) {
 	if sc.Nodes[info.Name] != nil {
 		sc.Nodes[info.Name].NumaInfo = nil
-		sc.Nodes[info.Name].NumaChgFlag = schedulingapi.NumaInfoResetFlag
 		klog.V(3).Infof("delete numainfo in cache for node<%s>", info.Name)
 	}
 }
@@ -1314,6 +1661,12 @@ func (sc *SchedulerCache) AddJob(obj interface{}) {
 	sc.Jobs[job.UID] = job
 }
 
+// csiAttachLimitResourceName returns the node ResourceName used for per-CSI-driver volume attach limits.
+// This must stay aligned with kubelet naming (formerly k8s.io/kubernetes/pkg/volume/util.GetCSIAttachLimitKey).
+func csiAttachLimitResourceName(driverName string) v1.ResourceName {
+	return v1.ResourceName("attachable-volumes-csi-" + strings.ReplaceAll(driverName, "/", "-"))
+}
+
 func (sc *SchedulerCache) setCSIResourceOnNode(csiNode *sv1.CSINode, node *v1.Node) {
 	if csiNode == nil || node == nil {
 		return
@@ -1322,7 +1675,7 @@ func (sc *SchedulerCache) setCSIResourceOnNode(csiNode *sv1.CSINode, node *v1.No
 	csiResources := make(map[v1.ResourceName]resource.Quantity)
 	for i := range csiNode.Spec.Drivers {
 		d := csiNode.Spec.Drivers[i]
-		k := v1.ResourceName(volumeutil.GetCSIAttachLimitKey(d.Name))
+		k := csiAttachLimitResourceName(d.Name)
 		if d.Allocatable != nil && d.Allocatable.Count != nil {
 			csiResources[k] = *resource.NewScaledQuantity(int64(*d.Allocatable.Count), -3)
 		} else {
@@ -1353,13 +1706,18 @@ func (sc *SchedulerCache) setCSIResourceOnNode(csiNode *sv1.CSINode, node *v1.No
 }
 
 // AddHyperNode adds hyperNode name to the hyperNodesQueue.
-func (sc *SchedulerCache) AddHyperNode(obj interface{}) {
+func (sc *SchedulerCache) AddHyperNode(obj interface{}, isInInitialList bool) {
 	hn, ok := obj.(*topologyv1alpha1.HyperNode)
 	if !ok {
 		klog.ErrorS(nil, "Cannot convert to *topologyv1alpha1.HyperNode", "type", reflect.TypeOf(obj))
 		return
 	}
-	sc.hyperNodesQueue.Add(string(hyperNodeEventSourceHyperNode) + "/" + hn.Name)
+	object := string(hyperNodeEventSourceHyperNode) + "/" + hn.Name
+	sc.hyperNodesQueue.Add(schedulercache.QueueObjectWrapper{Object: object, IsInInitialList: isInInitialList})
+	if isInInitialList {
+		//tack the obj handling from inital list
+		sc.hyperNodesInitialEventTracker.Add(object)
+	}
 }
 
 // UpdateHyperNode adds hyperNode name to the hyperNodesQueue.
@@ -1369,7 +1727,7 @@ func (sc *SchedulerCache) UpdateHyperNode(oldObj, newObj interface{}) {
 		klog.ErrorS(nil, "Cannot convert newObj to *topologyv1alpha1.HyperNode: %v", reflect.TypeOf(newObj))
 		return
 	}
-	sc.hyperNodesQueue.Add(string(hyperNodeEventSourceHyperNode) + "/" + newHyperNode.Name)
+	sc.hyperNodesQueue.Add(schedulercache.QueueObjectWrapper{Object: string(hyperNodeEventSourceHyperNode) + "/" + newHyperNode.Name, IsInInitialList: false})
 }
 
 // DeleteHyperNode adds hyperNode name to the hyperNodesQueue.
@@ -1389,7 +1747,7 @@ func (sc *SchedulerCache) DeleteHyperNode(obj interface{}) {
 		klog.ErrorS(nil, "Cannot convert to HyperNode", "type", reflect.TypeOf(t))
 		return
 	}
-	sc.hyperNodesQueue.Add(string(hyperNodeEventSourceHyperNode) + "/" + hn.Name)
+	sc.hyperNodesQueue.Add(schedulercache.QueueObjectWrapper{Object: string(hyperNodeEventSourceHyperNode) + "/" + hn.Name, IsInInitialList: false})
 }
 
 // UpdateHyperNode updates HyperNode and rebuild HyperNodesInfo cache, it does three things in order:
@@ -1403,4 +1761,51 @@ func (sc *SchedulerCache) updateHyperNode(hn *topologyv1alpha1.HyperNode) error 
 // It clears current hyperNode and update ancestors' cache.
 func (sc *SchedulerCache) deleteHyperNode(name string) error {
 	return sc.HyperNodesInfo.DeleteHyperNode(name)
+}
+
+// AddNodeShard add nodeshard to scheduler cache
+func (sc *SchedulerCache) AddNodeShard(obj interface{}) {
+	shard, ok := obj.(*nodeshardv1alpha1.NodeShard)
+	if !ok {
+		klog.Errorf("Cannot convert to *nodeshardv1alpha1.NodeShard: %v", obj)
+		return
+	}
+	sc.addOrUpdateNodeShard(shard)
+}
+
+// UpdateNodeShard update nodeshard to scheduler cache
+func (sc *SchedulerCache) UpdateNodeShard(oldObj, newObj interface{}) {
+	newShard, ok := newObj.(*nodeshardv1alpha1.NodeShard)
+	if !ok {
+		klog.Errorf("Cannot convert newObj to *nodeshardv1alpha1.NodeShard: %v", newObj)
+		return
+	}
+	sc.addOrUpdateNodeShard(newShard)
+}
+
+// DeleteNodeShard delete nodeshard from scheduler cache
+func (sc *SchedulerCache) DeleteNodeShard(obj interface{}) {
+	shard, ok := obj.(*nodeshardv1alpha1.NodeShard)
+	if !ok {
+		klog.Errorf("Cannot convert to *nodeshardv1alpha1.NodeShard: %v", obj)
+		return
+	}
+	sc.deleteNodeShard(shard.Name)
+}
+
+func (sc *SchedulerCache) addOrUpdateNodeShard(shard *nodeshardv1alpha1.NodeShard) {
+	shardInfo := schedulingapi.NewNodeShardInfo(shard)
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+	sc.NodeShards[shard.Name] = shardInfo
+	sc.RefreshNodeShards()
+}
+
+func (sc *SchedulerCache) deleteNodeShard(name string) {
+	if _, ok := sc.NodeShards[name]; ok {
+		sc.Mutex.Lock()
+		defer sc.Mutex.Unlock()
+		delete(sc.NodeShards, name)
+		sc.RefreshNodeShards()
+	}
 }

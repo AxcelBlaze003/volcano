@@ -17,6 +17,8 @@ limitations under the License.
 package cache
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -24,11 +26,39 @@ import (
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"stathat.com/c/consistent"
 
 	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	"volcano.sh/volcano/pkg/features"
+	schedulingapi "volcano.sh/volcano/pkg/scheduler/api"
+	commonutil "volcano.sh/volcano/pkg/util"
 )
+
+func resolveQueueReference(namespace, reference, defaultQueue string) (schedulingapi.QueueID, error) {
+	if reference == "" {
+		reference = defaultQueue
+	}
+	if commonutil.HasNamespaceQueuePrefix(reference) &&
+		!utilfeature.DefaultFeatureGate.Enabled(features.NamespaceQueue) {
+		return "", fmt.Errorf("NamespaceQueue feature is disabled")
+	}
+	if reference == "" {
+		return "", nil
+	}
+	resolved, err := commonutil.ResolveWorkloadQueueReference(namespace, reference, "")
+	if err != nil {
+		return "", err
+	}
+	if resolved.Scope == commonutil.ClusterQueueReferenceScope {
+		return schedulingapi.QueueID(resolved.Name), nil
+	}
+	return schedulingapi.NamespaceQueueID(resolved.Namespace, resolved.Name), nil
+}
 
 type hyperNodeEventSource string
 
@@ -131,4 +161,36 @@ func getHyperNodeEventSource(source string) []string {
 		return nil
 	}
 	return parts
+}
+
+// RemoveVolcanoSchGate removes the Volcano scheduling gate from a pod by namespace and name.
+// Returns nil if gate is successfully removed or already removed (idempotent).
+func RemoveVolcanoSchGate(kubeClient kubernetes.Interface, namespace, name string) error {
+	// We only need to specify the gate we want to remove.
+	// The "$patch": "delete" directive tells the Strategic Merge Patcher
+	// to find the gate with this name and remove it.
+	patch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"schedulingGates": []map[string]interface{}{
+				{
+					"name":   scheduling.QueueAllocationGateKey,
+					"$patch": "delete",
+				},
+			},
+		},
+	}
+
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+
+	_, err = kubeClient.CoreV1().Pods(namespace).Patch(
+		context.Background(),
+		name,
+		types.StrategicMergePatchType,
+		patchBytes,
+		metav1.PatchOptions{})
+
+	return err
 }

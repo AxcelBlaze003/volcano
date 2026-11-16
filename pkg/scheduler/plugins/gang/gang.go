@@ -72,6 +72,14 @@ func (gp *gangPlugin) OnSessionOpen(ssn *framework.Session) {
 			}
 		}
 
+		if valid := job.CheckSubJobValid(); !valid {
+			return &api.ValidateResult{
+				Pass:    false,
+				Reason:  v1beta1.NotEnoughPodsOfTaskReason,
+				Message: "Not enough valid subGroups of each task for gang-scheduling",
+			}
+		}
+
 		vtn := job.ValidTaskNum()
 		if vtn < job.MinAvailable {
 			return &api.ValidateResult{
@@ -92,6 +100,12 @@ func (gp *gangPlugin) OnSessionOpen(ssn *framework.Session) {
 
 		for _, preemptee := range preemptees {
 			job := ssn.Jobs[preemptee.Job]
+			if job == nil {
+				klog.Warningf("[gang] Skip preemptee <%s/%s>: job <%s> not found in session (orphaned task from deleted PodGroup)",
+					preemptee.Namespace, preemptee.Name, preemptee.Job)
+				continue
+			}
+
 			if _, found := jobOccupiedMap[job.UID]; !found {
 				jobOccupiedMap[job.UID] = job.ReadyTaskNum()
 			}
@@ -113,6 +127,14 @@ func (gp *gangPlugin) OnSessionOpen(ssn *framework.Session) {
 	// TODO(k82cn): Support preempt/reclaim batch job.
 	ssn.AddReclaimableFn(gp.Name(), preemptableFn)
 	ssn.AddPreemptableFn(gp.Name(), preemptableFn)
+
+	// Currently handles GangReclaim and GangPreempt only.
+	// Support for legacy task-level preempt/reclaim will be added in the future.
+	ssn.AddUnifiedEvictableFn(gp.Name(), func(_ *api.EvictionContext, candidates []*api.TaskInfo) ([]*api.TaskInfo, int) {
+		// Gang-aware eviction uses the bundle model (safe/whole split) to manage
+		// MinAvailable constraints, so the plugin permits all candidates here.
+		return candidates, util.Permit
+	})
 
 	jobOrderFn := func(l, r interface{}) int {
 		lv := l.(*api.JobInfo)
@@ -138,24 +160,63 @@ func (gp *gangPlugin) OnSessionOpen(ssn *framework.Session) {
 
 		return 0
 	}
-
 	ssn.AddJobOrderFn(gp.Name(), jobOrderFn)
+
+	subJobOrderFn := func(l, r interface{}) int {
+		lv := l.(*api.SubJobInfo)
+		rv := r.(*api.SubJobInfo)
+
+		lReady := lv.IsReady()
+		rReady := rv.IsReady()
+
+		klog.V(4).Infof("Gang SubJobOrderFn: <%v> is ready: %t, <%v> is ready: %t",
+			lv.UID, lReady, rv.UID, rReady)
+
+		if lReady && rReady {
+			return 0
+		}
+
+		if lReady {
+			return 1
+		}
+
+		if rReady {
+			return -1
+		}
+
+		return 0
+	}
+	ssn.AddSubJobOrderFn(gp.Name(), subJobOrderFn)
+
 	ssn.AddJobReadyFn(gp.Name(), func(obj interface{}) bool {
 		ji := obj.(*api.JobInfo)
-		if ji.CheckTaskReady() && ji.IsReady() {
+		if ji.CheckTaskReady() && ji.CheckSubJobReady() && ji.IsReady() {
 			return true
 		}
 		return false
 	})
 
+	ssn.AddSubJobReadyFn(gp.Name(), func(obj interface{}) bool {
+		sji := obj.(*api.SubJobInfo)
+		return sji.IsReady()
+	})
+
 	pipelinedFn := func(obj interface{}) int {
 		ji := obj.(*api.JobInfo)
-		if ji.CheckTaskPipelined() && ji.IsPipelined() {
+		if ji.CheckTaskPipelined() && ji.CheckSubJobPipelined() && ji.IsPipelined() {
 			return util.Permit
 		}
 		return util.Reject
 	}
 	ssn.AddJobPipelinedFn(gp.Name(), pipelinedFn)
+
+	ssn.AddSubJobPipelinedFn(gp.Name(), func(obj interface{}) int {
+		sji := obj.(*api.SubJobInfo)
+		if sji.IsPipelined() {
+			return util.Permit
+		}
+		return util.Reject
+	})
 
 	jobStarvingFn := func(obj interface{}) bool {
 		ji := obj.(*api.JobInfo)
@@ -174,6 +235,9 @@ func (gp *gangPlugin) OnSessionClose(ssn *framework.Session) {
 			continue
 		}
 		if !job.IsReady() {
+			if shouldSkipUnschedulableForReleasing(job) {
+				continue
+			}
 			schedulableTaskNum := func() (num int32) {
 				for _, task := range job.TaskStatusIndex[api.Pending] {
 					ctx := task.GetTransactionContext()
@@ -191,7 +255,9 @@ func (gp *gangPlugin) OnSessionClose(ssn *framework.Session) {
 				unreadyTaskCount, len(job.Tasks), job.FitError())
 
 			unScheduleJobCount++
-			metrics.RegisterJobRetries(job.Name)
+			if !ssn.IsJobTerminated(job.UID) {
+				metrics.RegisterJobRetries(job.Name)
+			}
 
 			// TODO: If the Job is gang-unschedulable due to scheduling gates
 			// we need a new message and reason to tell users
@@ -224,9 +290,32 @@ func (gp *gangPlugin) OnSessionClose(ssn *framework.Session) {
 					job.Namespace, job.Name, err)
 			}
 		}
-		metrics.UpdateUnscheduleTaskCount(job.Name, int(unreadyTaskCount))
+		if !ssn.IsJobTerminated(job.UID) {
+			metrics.UpdateUnscheduleTaskCount(job.Name, int(unreadyTaskCount))
+		}
 		unreadyTaskCount = 0
 	}
 
 	metrics.UpdateUnscheduleJobCount(unScheduleJobCount)
+}
+
+// shouldSkipUnschedulableForReleasing reports whether an unready job has enough
+// effective scheduled tasks to satisfy minAvailable. Releasing tasks still
+// assigned to nodes count because their Pods continue to occupy gang slots.
+// Pending or Pipelined tasks prevent this shortcut because they still require
+// scheduling.
+func shouldSkipUnschedulableForReleasing(job *api.JobInfo) bool {
+	scheduledReleasing := job.ReleasingScheduledTaskNum()
+	if scheduledReleasing == 0 {
+		return false
+	}
+
+	// Pending or Pipelined tasks still require the normal gang condition so they
+	// remain visible as work that needs to be scheduled.
+	if len(job.TaskStatusIndex[api.Pending]) > 0 || len(job.TaskStatusIndex[api.Pipelined]) > 0 {
+		return false
+	}
+
+	effectiveScheduled := job.ScheduledTaskNum() + scheduledReleasing
+	return effectiveScheduled >= job.MinAvailable
 }

@@ -5,6 +5,7 @@
 {{ $controller_main_csc := or .Values.custom.controller_main_csc .Values.custom.default_csc }}
 {{ $controller_ns := or .Values.custom.controller_ns .Values.custom.default_ns }}
 {{ $scheduler_name := .Values.custom.scheduler_name }}
+{{ $controller_feature_gates := include "volcano.featureGates" (dict "gates" .Values.custom.controller_feature_gates "namespaceQueueEnabled" .Values.custom.namespace_queue_enable) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -48,7 +49,7 @@ rules:
     verbs: ["create", "list", "watch", "update", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "get", "list", "watch", "delete", "patch"]
+    verbs: ["create", "get", "list", "watch", "delete", "patch", "update"]
   - apiGroups: [""]
     resources: ["pods/finalizers"]
     verbs: ["update", "patch"]
@@ -67,6 +68,15 @@ rules:
   - apiGroups: ["scheduling.incubator.k8s.io", "scheduling.volcano.sh"]
     resources: ["podgroups", "queues", "queues/status"]
     verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["namespacequeues"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["namespacequeues/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["namespacequeues/finalizers"]
+    verbs: ["update", "patch"]
   - apiGroups: ["flow.volcano.sh"]
     resources: ["jobflows", "jobtemplates"]
     verbs: ["get", "list", "watch", "create", "delete", "update"]
@@ -97,6 +107,12 @@ rules:
   - apiGroups: [ "" ]
     resources: [ "nodes" ]
     verbs: [ "list", "watch" ]
+  - apiGroups: ["shard.volcano.sh"]
+    resources: ["nodeshards", "nodeshards/status"]
+    verbs: ["list", "watch", "get", "create", "delete", "update", "patch"]
+  - apiGroups: ["config.volcano.sh"]
+    resources: ["colocationconfigurations"]
+    verbs: ["get", "list", "watch"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
@@ -165,10 +181,19 @@ spec:
           resources:
             {{- toYaml .Values.custom.controller_resources | nindent 14 }}
             {{- end }}
-          image: {{ .Values.basic.image_registry }}/{{.Values.basic.controller_image_name}}:{{.Values.basic.image_tag_version}}
+          image: {{ .Values.basic.image_registry }}/{{.Values.basic.controller_image_name}}:{{ .Values.basic.controller_image_tag_version | default .Values.basic.image_tag_version }}
+            {{- if .Values.custom.controller_liveness_probe }}
+          livenessProbe:
+            {{- include "volcano.probe" (dict "port" .Values.basic.healthz_port "scheme" "HTTP" "values" .Values.custom.controller_liveness_probe) | nindent 12 }}
+            {{- end }}
+            {{- if .Values.custom.controller_readiness_probe }}
+          readinessProbe:
+            {{- include "volcano.probe" (dict "port" .Values.basic.healthz_port "scheme" "HTTP" "values" .Values.custom.controller_readiness_probe) | nindent 12 }}
+            {{- end }}
           args:
             - --logtostderr
             - --enable-healthz=true
+            - --healthz-address=:{{ .Values.basic.healthz_port }}
               {{- if .Values.custom.controller_metrics_enable }}
             - --enable-metrics=true
               {{- end }}
@@ -194,6 +219,20 @@ spec:
               {{- if .Values.custom.controller_worker_threads_for_podgroup }}
             - --worker-threads-for-podgroup={{.Values.custom.controller_worker_threads_for_podgroup}}
               {{- end }}
+              {{- if .Values.custom.sharding_configmap_enable }}
+            - --sharding-configmap={{ .Release.Name }}-sharding-configmap
+            - --sharding-configmap-namespace={{ .Release.Namespace }}
+              {{- end }}
+              {{- $enabledControllers := .Values.custom.controller_enabled_controllers | default "" }}
+              {{- if ne (include "hypernodeControllerMode" .) "controller-manager" }}
+                {{- $enabledControllers = printf "%s,-hyperNode-controller" ($enabledControllers | default "*,-sharding-controller") }}
+              {{- end }}
+              {{- if $enabledControllers }}
+            - --controllers={{ $enabledControllers }}
+              {{- end }}
+              {{- if $controller_feature_gates }}
+            - --feature-gates={{ $controller_feature_gates }}
+              {{- end }}
             - -v={{.Values.custom.controller_log_level}}
             - 2>&1
           imagePullPolicy: {{ .Values.basic.image_pull_policy }}
@@ -206,6 +245,13 @@ spec:
             value: {{ .Release.Namespace }}
           - name: HELM_RELEASE_NAME
             value: {{ .Release.Name }}
+          {{- if .Values.custom.go_memlimit_enable }}
+          - name: GOMEMLIMIT
+            valueFrom:
+              resourceFieldRef:
+                resource: limits.memory
+                divisor: "1"
+          {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -231,19 +277,21 @@ spec:
     app: volcano-controller
   type: ClusterIP
 
+{{- if .Values.custom.sharding_configmap_enable }}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ .Release.Name }}-controller-configmap
+  name: {{ .Release.Name }}-sharding-configmap
   namespace: {{ .Release.Namespace }}
   {{- if .Values.custom.common_labels }}
   labels:
     {{- toYaml .Values.custom.common_labels | nindent 4 }}
   {{- end }}
 data:
-  volcano-controller.conf: |
-  {{- if .Values.custom.controller_config_override }}
-  {{ toYaml .Values.custom.controller_config_override | nindent 4 }}
+  sharding.yaml: |
+  {{- if .Values.custom.sharding_configmap_data }}
+    {{- .Values.custom.sharding_configmap_data | nindent 4 }}
   {{- end }}
+{{- end }}
 {{- end }}

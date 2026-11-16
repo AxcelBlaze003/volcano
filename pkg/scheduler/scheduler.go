@@ -31,26 +31,31 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/cmd/scheduler/app/options"
+	"volcano.sh/volcano/pkg/features"
 	"volcano.sh/volcano/pkg/filewatcher"
 	schedcache "volcano.sh/volcano/pkg/scheduler/cache"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/gate"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
+	"volcano.sh/volcano/pkg/scheduler/unschedulable"
 )
 
 // Scheduler represents a "Volcano Scheduler".
 // Scheduler watches for new unscheduled pods(PodGroup) in Volcano.
 // It attempts to find nodes that can accommodate these pods and writes the binding information back to the API server.
 type Scheduler struct {
-	cache          schedcache.Cache
-	schedulerConf  string
-	fileWatcher    filewatcher.FileWatcher
-	schedulePeriod time.Duration
-	once           sync.Once
+	cache                 schedcache.Cache
+	unschedulableJobCache *unschedulable.JobCache
+	schedulerConf         string
+	fileWatcher           filewatcher.FileWatcher
+	schedulePeriod        time.Duration
+	once                  sync.Once
 
 	mutex              sync.Mutex
 	actions            []framework.Action
@@ -59,6 +64,9 @@ type Scheduler struct {
 	metricsConf        map[string]string
 	dumper             schedcache.Dumper
 	disableDefaultConf bool
+
+	// schGateManager is used for async scheduling gate removal.
+	schGateManager *gate.SchGateManager
 }
 
 // NewScheduler returns a Scheduler
@@ -73,14 +81,23 @@ func NewScheduler(config *rest.Config, opt *options.ServerOption) (*Scheduler, e
 		}
 	}
 
-	cache := schedcache.New(config, opt.SchedulerNames, opt.DefaultQueue, opt.NodeSelector, opt.NodeWorkerThreads, opt.IgnoredCSIProvisioners, opt.ResyncPeriod)
+	metrics.SetUnschedulableJobCacheDebugMetricsEnabled(opt.UnschedulableJobCacheDebugMetrics)
+
+	var unschedulableJobCache *unschedulable.JobCache
+	var cacheOptions []schedcache.Option
+	if utilfeature.DefaultFeatureGate.Enabled(features.UnschedulableJobCache) {
+		unschedulableJobCache = unschedulable.NewJobCache(opt.UnschedulableJobCacheMaxSkipDuration)
+		cacheOptions = append(cacheOptions, schedcache.WithUnschedulableJobCache(unschedulableJobCache))
+	}
+	cache := schedcache.New(config, opt.SchedulerNames, opt.DefaultQueue, opt.NodeSelector, opt.NodeWorkerThreads, opt.IgnoredCSIProvisioners, opt.ResyncPeriod, opt.ResourceSyncTimeout, cacheOptions...)
 	scheduler := &Scheduler{
-		schedulerConf:      opt.SchedulerConf,
-		fileWatcher:        watcher,
-		cache:              cache,
-		schedulePeriod:     opt.SchedulePeriod,
-		dumper:             schedcache.Dumper{Cache: cache, RootDir: opt.CacheDumpFileDir},
-		disableDefaultConf: opt.DisableDefaultSchedulerConfig,
+		schedulerConf:         opt.SchedulerConf,
+		fileWatcher:           watcher,
+		cache:                 cache,
+		unschedulableJobCache: unschedulableJobCache,
+		schedulePeriod:        opt.SchedulePeriod,
+		dumper:                schedcache.Dumper{Cache: cache, RootDir: opt.CacheDumpFileDir},
+		disableDefaultConf:    opt.DisableDefaultSchedulerConfig,
 	}
 
 	return scheduler, nil
@@ -90,9 +107,23 @@ func NewScheduler(config *rest.Config, opt *options.ServerOption) (*Scheduler, e
 // initializes the cache, and begins the scheduling process.
 func (pc *Scheduler) Run(stopCh <-chan struct{}) {
 	pc.loadSchedulerConf()
+
+	// Start the gate manager (if the feature gate is enabled).
+	if utilfeature.DefaultFeatureGate.Enabled(features.SchedulingGatesQueueAdmission) {
+		pc.schGateManager = gate.NewSchGateManager(pc.cache.Client(), options.ServerOpts.GateRemovalWorkerNum)
+		pc.schGateManager.Start()
+		go func() {
+			<-stopCh
+			pc.schGateManager.Stop()
+		}()
+	}
+
 	go pc.watchSchedulerConf(stopCh)
 	// Start cache for policy.
 	pc.cache.SetMetricsConf(pc.metricsConf)
+	if pc.unschedulableJobCache != nil {
+		pc.unschedulableJobCache.Run(stopCh)
+	}
 	pc.cache.Run(stopCh)
 	klog.V(2).Infof("Scheduler completes Initialization and start to run")
 	go wait.Until(pc.runOnce, pc.schedulePeriod, stopCh)
@@ -121,7 +152,8 @@ func (pc *Scheduler) runOnce() {
 		conf.EnabledActionMap[action.Name()] = true
 	}
 
-	ssn := framework.OpenSession(pc.cache, plugins, configurations)
+	ssn := framework.OpenSession(pc.cache, plugins, configurations, framework.WithUnschedulableJobCache(pc.unschedulableJobCache))
+	ssn.SetSchGateManager(pc.schGateManager)
 	defer func() {
 		framework.CloseSession(ssn)
 		metrics.UpdateE2eDuration(metrics.Duration(scheduleStartTime))
@@ -134,12 +166,17 @@ func (pc *Scheduler) runOnce() {
 	}
 }
 
+// logLoadedSchedulerConf logs the scheduler configuration that was actually
+// applied, line by line, to facilitate debugging.
+func logLoadedSchedulerConf(confStr string) {
+	klog.V(2).Infoln("Successfully loaded Scheduler conf as follows:")
+	for _, line := range strings.Split(strings.TrimSpace(confStr), "\n") {
+		klog.V(2).Infoln(line)
+	}
+}
+
 func (pc *Scheduler) loadSchedulerConf() {
 	klog.V(4).Infof("Start loadSchedulerConf ...")
-	defer func() {
-		actions, plugins := pc.getSchedulerConf()
-		klog.V(2).Infof("Finished loading scheduler config. Final state: actions=%v, plugins=%v", actions, plugins)
-	}()
 
 	if pc.disableDefaultConf && len(pc.schedulerConf) == 0 {
 		klog.Fatalf("No --scheduler-conf path provided and default configuration fallback is disabled")
@@ -152,6 +189,7 @@ func (pc *Scheduler) loadSchedulerConf() {
 			if err != nil {
 				klog.Fatalf("Invalid default configuration: unmarshal Scheduler config %s failed: %v", DefaultSchedulerConf, err)
 			}
+			logLoadedSchedulerConf(DefaultSchedulerConf)
 		})
 	}
 
@@ -184,18 +222,7 @@ func (pc *Scheduler) loadSchedulerConf() {
 	pc.configurations = configurations
 	pc.metricsConf = metricsConf
 	pc.mutex.Unlock()
-}
-
-func (pc *Scheduler) getSchedulerConf() (actions []string, plugins []string) {
-	for _, action := range pc.actions {
-		actions = append(actions, action.Name())
-	}
-	for _, tier := range pc.plugins {
-		for _, plugin := range tier.Plugins {
-			plugins = append(plugins, plugin.Name)
-		}
-	}
-	return
+	logLoadedSchedulerConf(config)
 }
 
 func (pc *Scheduler) watchSchedulerConf(stopCh <-chan struct{}) {

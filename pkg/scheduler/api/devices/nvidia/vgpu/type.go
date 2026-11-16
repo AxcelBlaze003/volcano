@@ -22,6 +22,8 @@ const (
 
 	GPUInUse                         = "nvidia.com/use-gputype"
 	GPUNoUse                         = "nvidia.com/nouse-gputype"
+	VGPUUseUUIDAnnotation            = "volcano.sh/vgpu-use-gpuuuid"
+	VGPUNoUseUUIDAnnotation          = "volcano.sh/vgpu-nouse-gpuuuid"
 	AssignedTimeAnnotations          = "volcano.sh/vgpu-time"
 	AssignedIDsAnnotations           = "volcano.sh/vgpu-ids-new"
 	AssignedIDsToAllocateAnnotations = "volcano.sh/devices-to-allocate"
@@ -49,25 +51,19 @@ const (
 	binpackMultiplier    = 100
 	spreadMultiplier     = 100
 
-	GPUModeAnnotation      = "volcano.sh/vgpu-mode"
-	vGPUControllerHAMICore = "hami-core"
-	vGPUControllerMIG      = "mig"
-	vGPUControllerMPS      = "mps"
+	GPUModeAnnotation             = "volcano.sh/vgpu-mode"
+	VGPUPodGroupPolicyAnnotation  = "volcano.sh/vgpu-podgroup-policy"
+	VGPUPodGroupPolicySpreadValue = "spread"
+	vGPUControllerHAMICore        = "hami-core"
+	vGPUControllerMIG             = "mig"
+	vGPUControllerMPS             = "mps"
 )
 
 var (
 	VGPUEnable     bool
 	NodeLockEnable bool
+	SchedulePolicy string
 )
-
-type ContainerDeviceRequest struct {
-	Nums int32
-	// device type, like NVIDIA, MLU
-	Type             string
-	Memreq           uint
-	MemPercentagereq int32
-	Coresreq         uint
-}
 
 type ContainerDevice struct {
 	UUID string

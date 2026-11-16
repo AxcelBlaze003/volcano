@@ -18,17 +18,17 @@ package deviceshare
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"reflect"
+	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
-	"volcano.sh/volcano/pkg/scheduler/api/devices"
-	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/ascend310p/vnpu"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/hami"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/mindcluster/ascend310p/vnpu"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/config"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/gpushare"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/vgpu"
@@ -46,7 +46,8 @@ const (
 
 	VGPUEnable = "deviceshare.VGPUEnable"
 
-	ASCEND310PvGPU = "deviceshare.ASCEND310PVNPUEnable"
+	AscendMindClusterVNPU = "deviceshare.AscendMindClusterVNPUEnable"
+	AscendHAMiVNPUEnable  = "deviceshare.AscendHAMiVNPUEnable"
 
 	SchedulePolicyArgument = "deviceshare.SchedulePolicy"
 	ScheduleWeight         = "deviceshare.ScheduleWeight"
@@ -55,16 +56,35 @@ const (
 	KnownGeometriesCMNamespace = "deviceshare.KnownGeometriesCMNamespace"
 )
 
+var (
+	once sync.Once
+)
+
 type deviceSharePlugin struct {
 	// Arguments given for the plugin
 	pluginArguments framework.Arguments
 	schedulePolicy  string
 	scheduleWeight  int
+	// lock protects persistedGPUs and persistedPodRules from concurrent access
+	// across scheduling sessions and Allocate calls.
+	lock sync.RWMutex
+	// persistedGPUs survives across scheduling sessions. Maps
+	// nodeName → namespace/name → set of GPU indices allocated to that pod.
+	// Updated by Allocate, pruned by OnSessionOpen.
+	persistedGPUs map[string]map[string]map[int]struct{}
+	// persistedPodRules maps nodeName → namespace/name → set of rule indices.
+	persistedPodRules map[string]map[string]map[int]struct{}
 }
 
 // New return priority plugin
 func New(arguments framework.Arguments) framework.Plugin {
-	dsp := &deviceSharePlugin{pluginArguments: arguments, schedulePolicy: "", scheduleWeight: 0}
+	dsp := &deviceSharePlugin{
+		pluginArguments:   arguments,
+		schedulePolicy:    "",
+		scheduleWeight:    0,
+		persistedGPUs:     make(map[string]map[string]map[int]struct{}),
+		persistedPodRules: make(map[string]map[string]map[int]struct{}),
+	}
 	enablePredicate(dsp)
 	return dsp
 }
@@ -81,13 +101,16 @@ func enablePredicate(dsp *deviceSharePlugin) {
 	args.GetBool(&gpushare.GpuNumberEnable, GPUNumberPredicate)
 	args.GetBool(&nodeLockEnable, NodeLockEnable)
 	args.GetBool(&vgpu.VGPUEnable, VGPUEnable)
-	args.GetBool(&vnpu.Ascend310pvNPUEnable, ASCEND310PvGPU)
+	args.GetBool(&vnpu.AscendMindClusterVNPUEnable, AscendMindClusterVNPU)
+	args.GetBool(&hami.AscendHAMiVNPUEnable, AscendHAMiVNPUEnable)
 
 	gpushare.NodeLockEnable = nodeLockEnable
 	vgpu.NodeLockEnable = nodeLockEnable
+	hami.NodeLockEnable = nodeLockEnable
 
 	args.GetString(&dsp.schedulePolicy, SchedulePolicyArgument)
 	args.GetInt(&dsp.scheduleWeight, ScheduleWeight)
+	vgpu.SchedulePolicy = dsp.schedulePolicy
 
 	if gpushare.GpuSharingEnable && gpushare.GpuNumberEnable {
 		klog.Fatal("can not define true in both gpu sharing and gpu number")
@@ -96,14 +119,35 @@ func enablePredicate(dsp *deviceSharePlugin) {
 		klog.Fatal("gpu-share and vgpu can't be used together")
 	}
 
-	if !vgpu.VGPUEnable {
-		return
-	}
 	knownGeometriesCMName := "volcano-vgpu-device-config"
 	args.GetString(&knownGeometriesCMName, KnownGeometriesCMName)
 	knownGeometriesCMNamespace := "kube-system"
 	args.GetString(&knownGeometriesCMNamespace, KnownGeometriesCMNamespace)
 	config.InitDevicesConfig(knownGeometriesCMName, knownGeometriesCMNamespace)
+	registerDevices()
+}
+
+func registerDevices() {
+	once.Do(func() {
+		if gpushare.GpuSharingEnable || gpushare.GpuNumberEnable {
+			api.RegisterDevice(gpushare.DeviceName)
+		}
+		if vgpu.VGPUEnable {
+			api.RegisterDevice(vgpu.DeviceName)
+		}
+		if vnpu.AscendMindClusterVNPUEnable {
+			api.RegisterDevice(vnpu.DeviceName)
+		}
+		if hami.AscendHAMiVNPUEnable {
+			cfg := config.GetConfig()
+			if cfg != nil {
+				for _, vnpu := range cfg.VNPUConfigs() {
+					klog.V(3).Infof("register device %s", vnpu.CommonWord)
+					api.RegisterDevice(vnpu.CommonWord)
+				}
+			}
+		}
+	})
 }
 
 func createStatus(code int, reason string) *api.Status {
@@ -118,16 +162,12 @@ func getDeviceScore(ctx context.Context, pod *v1.Pod, node *api.NodeInfo, schedu
 	s := float64(0)
 	for deviceType, device := range node.Others {
 		if device.(api.Devices).HasDeviceRequest(pod) {
-			var ns float64
 			// Only process device types that use NodeOrderFn (vgpu and gpushare)
 			// vnpu devices use BatchNodeOrderFn, skip them here
-			if deviceType == vgpu.DeviceName || deviceType == gpushare.DeviceName {
-				ns = device.(api.Devices).ScoreNode(pod, schedulePolicy)
-			} else {
-				// Other device types (like vnpu) use BatchNodeOrderFn, skip scoring here
-				continue
+			if deviceType != vnpu.DeviceName {
+				ns := device.(api.Devices).ScoreNode(pod, schedulePolicy)
+				s += ns
 			}
-			s += ns
 		}
 	}
 	klog.V(4).Infof("deviceScore for task %s/%s is: %v", pod.Namespace, pod.Name, s)
@@ -172,14 +212,20 @@ func initializeDevicesWithSession(ssn *framework.Session) {
 func initializeDevice(device api.Devices, ssn *framework.Session, nodeInfo *api.NodeInfo) error {
 	switch d := device.(type) {
 	case *vnpu.NPUDevices:
-		klog.V(3).Infof("initialize ascend310p device.")
-		return vnpu310p.InitVNPUDevice(d, ssn, nodeInfo)
-	default:
-		return nil
+		if vnpu.AscendMindClusterVNPUEnable {
+			klog.V(3).Infof("initialize ascend310p device.")
+			return vnpu310p.InitVNPUDevice(d, ssn, nodeInfo)
+		}
 	}
+	return nil
 }
 
 func (dp *deviceSharePlugin) OnSessionOpen(ssn *framework.Session) {
+	// Wrap GPU devices with exclusivity-aware wrappers if rules are configured.
+	// This must happen before initializeDevicesWithSession and predicate registration
+	// so that the wrapped devices are used throughout the scheduling cycle.
+	dp.wrapGPUDevicesForExclusivity(ssn)
+
 	// initialize devices which needs ssn as input
 	initializeDevicesWithSession(ssn)
 
@@ -190,20 +236,16 @@ func (dp *deviceSharePlugin) OnSessionOpen(ssn *framework.Session) {
 		for _, val := range api.RegisteredDevices {
 			if dev, ok := node.Others[val].(api.Devices); ok {
 				if reflect.ValueOf(dev).IsNil() {
-					// TODO When a pod requests a device of the current type, but the current node does not have such a device, an error is thrown
-					if dev == nil || dev.HasDeviceRequest(task.Pod) {
-						predicateStatus = append(predicateStatus, &api.Status{
-							Code:   devices.Unschedulable,
-							Reason: "node not initialized with device" + val,
-							Plugin: PluginName,
-						})
-						return api.NewFitErrWithStatus(task, node, predicateStatus...)
-					}
+					klog.V(4).Infof("device %s is null, skipping it", val)
+					continue
+				}
+				if !dev.HasDeviceRequest(task.Pod) {
 					klog.V(4).Infof("pod %s/%s did not request device %s on %s, skipping it", task.Pod.Namespace, task.Pod.Name, val, node.Name)
 					continue
 				}
 				code, msg, err := dev.FilterNode(task.Pod, dp.schedulePolicy)
 				if err != nil {
+					klog.V(4).Infof("pod %s/%s fit failed. device %s node %s err %v", task.Pod.Namespace, task.Pod.Name, val, node.Name, err)
 					predicateStatus = append(predicateStatus, createStatus(code, msg))
 					return api.NewFitErrWithStatus(task, node, predicateStatus...)
 				}
@@ -233,7 +275,7 @@ func (dp *deviceSharePlugin) OnSessionOpen(ssn *framework.Session) {
 				return 0, status.AsError()
 			}
 
-			// TODO: we should use a seperate plugin for devices, and seperate them from predicates and nodeOrder plugin.
+			// TODO: we should use a separate plugin for devices, and separate them from predicates and nodeOrder plugin.
 			nodeScore = float64(score) * float64(dp.scheduleWeight)
 			klog.V(5).Infof("Node: %s, task<%s/%s> Device Score weight %d, score: %f", node.Name, task.Namespace, task.Name, dp.scheduleWeight, nodeScore)
 		}
@@ -257,10 +299,11 @@ func (dp *deviceSharePlugin) OnSessionOpen(ssn *framework.Session) {
 					if ok {
 						if deviceInterface, isDeviceInterface := device.(api.Devices); isDeviceInterface {
 							if reflect.ValueOf(deviceInterface).IsNil() {
-								if deviceInterface == nil || deviceInterface.HasDeviceRequest(task.Pod) {
-									return nil, fmt.Errorf("node not initialized with device %s", deviceType)
-								}
-								klog.V(4).Infof("pod %s/%s did not request device %s on %s, skipping it", task.Pod.Namespace, task.Pod.Name, deviceType, nodes[0].Name)
+								klog.V(4).Infof("device %s is null on node %s, skipping", deviceType, node.Name)
+								continue
+							}
+							if !deviceInterface.HasDeviceRequest(task.Pod) {
+								klog.V(4).Infof("pod %s/%s did not request device %s on %s, skipping it", task.Pod.Namespace, task.Pod.Name, deviceType, node.Name)
 								continue
 							}
 							allDevices = append(allDevices, deviceInterface)

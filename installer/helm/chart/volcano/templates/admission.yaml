@@ -5,6 +5,8 @@
 {{ $admission_main_csc := or .Values.custom.admission_main_csc .Values.custom.default_csc }}
 {{ $admission_ns := or .Values.custom.admission_ns .Values.custom.default_ns }}
 {{ $scheduler_name := .Values.custom.scheduler_name }}
+{{ $enabled_admissions := include "volcano.enabledAdmissions" (dict "admissions" .Values.custom.enabled_admissions "namespaceQueueEnabled" .Values.custom.namespace_queue_enable) }}
+{{ $admission_feature_gates := include "volcano.featureGates" (dict "gates" .Values.custom.admission_feature_gates "namespaceQueueEnabled" .Values.custom.namespace_queue_enable) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -57,13 +59,16 @@ rules:
   - apiGroups: ["scheduling.incubator.k8s.io", "scheduling.volcano.sh"]
     resources: ["queues"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["namespacequeues"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]
   - apiGroups: ["scheduling.incubator.k8s.io", "scheduling.volcano.sh"]
     resources: ["podgroups"]
     verbs: ["get", "list", "watch"]
-  {{- if .Values.custom.enabled_admissions | regexMatch "/podgroups/mutate" }}
+  {{- if $enabled_admissions | regexMatch "/podgroups/mutate" }}
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
@@ -135,7 +140,7 @@ spec:
       {{- end }}
       containers:
         - args:
-            - --enabled-admission={{ .Values.custom.enabled_admissions }}
+            - --enabled-admission={{ $enabled_admissions }}
             - --tls-cert-file=/admission.local.config/certificates/tls.crt
             - --tls-private-key-file=/admission.local.config/certificates/tls.key
             - --ca-cert-file=/admission.local.config/certificates/ca.crt
@@ -145,14 +150,27 @@ spec:
             {{- if $scheduler_name }}
             - --scheduler-name={{- $scheduler_name }}
             {{- end }}
+            {{- if $admission_feature_gates }}
+            - --feature-gates={{ $admission_feature_gates }}
+            {{- end }}
+            - --enable-root-queue-protection={{ .Values.custom.admission_root_queue_protection_enable }}
             - --enable-healthz=true
+            - --healthz-address=:{{ .Values.basic.healthz_port }}
             - --logtostderr
             - --port={{.Values.basic.admission_port}}
             - -v={{.Values.custom.admission_log_level}}
             - 2>&1
-          image: {{ .Values.basic.image_registry }}/{{.Values.basic.admission_image_name}}:{{.Values.basic.image_tag_version}}
+          image: {{ .Values.basic.image_registry }}/{{.Values.basic.admission_image_name}}:{{ .Values.basic.admission_image_tag_version | default .Values.basic.image_tag_version }}
           imagePullPolicy: {{ .Values.basic.image_pull_policy }}
           name: admission
+            {{- if .Values.custom.admission_liveness_probe }}
+          livenessProbe:
+            {{- include "volcano.probe" (dict "port" .Values.basic.healthz_port "scheme" "HTTPS" "values" .Values.custom.admission_liveness_probe) | nindent 12 }}
+            {{- end }}
+            {{- if .Values.custom.admission_readiness_probe }}
+          readinessProbe:
+            {{- include "volcano.probe" (dict "port" .Values.basic.healthz_port "scheme" "HTTPS" "values" .Values.custom.admission_readiness_probe) | nindent 12 }}
+            {{- end }}
           {{- if .Values.custom.admission_resources }}
           resources:
           {{- toYaml .Values.custom.admission_resources | nindent 12 }}
@@ -163,6 +181,14 @@ spec:
               readOnly: true
             - mountPath: /admission.local.config/configmap
               name: admission-config
+          {{- if .Values.custom.go_memlimit_enable }}
+          env:
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+                  divisor: "1"
+          {{- end }}
           {{- if $admission_main_csc }}
           securityContext:
             {{- toYaml $admission_main_csc | nindent 12 }}

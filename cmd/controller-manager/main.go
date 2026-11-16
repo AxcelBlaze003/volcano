@@ -16,22 +16,24 @@ limitations under the License.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
-	"runtime"
 	"sort"
 	"time"
 
 	"github.com/spf13/pflag"
-	_ "go.uber.org/automaxprocs"
+	"go.uber.org/automaxprocs/maxprocs"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	cliflag "k8s.io/component-base/cli/flag"
 	componentbaseoptions "k8s.io/component-base/config/options"
+	_ "k8s.io/component-base/metrics/prometheus/restclient"
 	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/cmd/controller-manager/app"
 	"volcano.sh/volcano/cmd/controller-manager/app/options"
+	_ "volcano.sh/volcano/pkg/controllers/colocationconfig"
 	_ "volcano.sh/volcano/pkg/controllers/cronjob"
 	"volcano.sh/volcano/pkg/controllers/framework"
 	_ "volcano.sh/volcano/pkg/controllers/garbagecollector"
@@ -39,8 +41,10 @@ import (
 	_ "volcano.sh/volcano/pkg/controllers/job"
 	_ "volcano.sh/volcano/pkg/controllers/jobflow"
 	_ "volcano.sh/volcano/pkg/controllers/jobtemplate"
+	_ "volcano.sh/volcano/pkg/controllers/namespacequeue"
 	_ "volcano.sh/volcano/pkg/controllers/podgroup"
 	_ "volcano.sh/volcano/pkg/controllers/queue"
+	_ "volcano.sh/volcano/pkg/controllers/sharding"
 	commonutil "volcano.sh/volcano/pkg/util"
 	"volcano.sh/volcano/pkg/version"
 )
@@ -48,8 +52,12 @@ import (
 var logFlushFreq = pflag.Duration("log-flush-frequency", 5*time.Second, "Maximum number of seconds between log flushes")
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
 	klog.InitFlags(nil)
+	// Opt into the new klog behavior so that -stderrthreshold is honored even
+	// when -logtostderr=true (the default).
+	// Ref: kubernetes/klog#212, kubernetes/klog#432
+	flag.Set("legacy_stderr_threshold_behavior", "false") //nolint:errcheck
+	flag.Set("stderrthreshold", "INFO")                   //nolint:errcheck
 
 	fs := pflag.CommandLine
 	s := options.NewServerOption()
@@ -64,6 +72,14 @@ func main() {
 		return controllerNames
 	}
 	s.AddFlags(fs, knownControllers())
+
+	// Register controller-specific flags for controllers that implement FlagProvider.
+	framework.ForeachController(func(controller framework.Controller) {
+		if fp, ok := controller.(framework.FlagProvider); ok {
+			fp.AddFlags(fs)
+		}
+	})
+
 	utilfeature.DefaultMutableFeatureGate.AddFlag(fs)
 
 	commonutil.LeaderElectionDefault(&s.LeaderElection)
@@ -71,6 +87,10 @@ func main() {
 	componentbaseoptions.BindLeaderElectionFlags(&s.LeaderElection, fs)
 
 	cliflag.InitFlags()
+
+	if _, err := maxprocs.Set(maxprocs.Logger(klog.Infof)); err != nil {
+		klog.Errorf("Failed to set GOMAXPROCS: %v", err)
+	}
 
 	if s.PrintVersion {
 		version.PrintVersionAndExit()

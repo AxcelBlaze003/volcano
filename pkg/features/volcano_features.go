@@ -38,7 +38,8 @@ const (
 	// PriorityClass to provide the capacity of preemption at pod group level.
 	PriorityClass featuregate.Feature = "PriorityClass"
 
-	// CSIStorage tracking of available storage capacity that CSI drivers provide
+	// CSIStorage is a legacy Volcano feature gate name. Scheduler cache registration of
+	// CSIDriver / CSIStorageCapacity informers is controlled by --csi-storage only.
 	CSIStorage featuregate.Feature = "CSIStorage"
 
 	// ResourceTopology supports resources like cpu/memory topology aware.
@@ -46,6 +47,21 @@ const (
 
 	// CronVolcanoJobSupport can identify and schedule volcano cronjob.
 	CronVolcanoJobSupport featuregate.Feature = "CronVolcanoJobSupport"
+
+	// SchedulingGatesQueueAdmission uses Kubernetes schedulingGates to delay
+	// setting the Unschedulable condition on pods until the queue has enough
+	// capacity, preventing cluster autoscalers from triggering unnecessary
+	// scale-ups for pods that are simply waiting for queue admission.
+	SchedulingGatesQueueAdmission featuregate.Feature = "SchedulingGatesQueueAdmission"
+
+	// UnschedulableJobCache enables cache-based skipping for jobs that stayed
+	// unschedulable in previous sessions and are retried only on subscribed
+	// cluster events or watchdog expiry.
+	UnschedulableJobCache featuregate.Feature = "UnschedulableJobCache"
+
+	// NamespaceQueue enables namespace-scoped queues and namespace-first
+	// PodGroup queue resolution.
+	NamespaceQueue featuregate.Feature = "NamespaceQueue"
 )
 
 func init() {
@@ -53,13 +69,16 @@ func init() {
 }
 
 var defaultVolcanoFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
+	NamespaceQueue:              {Default: false, PreRelease: featuregate.Alpha},
 	WorkLoadSupport:             {Default: true, PreRelease: featuregate.Alpha},
 	VolcanoJobSupport:           {Default: true, PreRelease: featuregate.Alpha},
 	PodDisruptionBudgetsSupport: {Default: true, PreRelease: featuregate.Alpha},
 	QueueCommandSync:            {Default: true, PreRelease: featuregate.Alpha},
 	PriorityClass:               {Default: true, PreRelease: featuregate.Alpha},
-	// CSIStorage is explicitly set to false by default.
-	CSIStorage:            {Default: false, PreRelease: featuregate.Alpha},
-	ResourceTopology:      {Default: true, PreRelease: featuregate.Alpha},
-	CronVolcanoJobSupport: {Default: true, PreRelease: featuregate.Alpha},
+	// CSIStorage default is kept for compatibility; cache CSI informers use --csi-storage.
+	CSIStorage:                    {Default: false, PreRelease: featuregate.Alpha},
+	ResourceTopology:              {Default: true, PreRelease: featuregate.Alpha},
+	CronVolcanoJobSupport:         {Default: true, PreRelease: featuregate.Alpha},
+	SchedulingGatesQueueAdmission: {Default: false, PreRelease: featuregate.Alpha},
+	UnschedulableJobCache:         {Default: false, PreRelease: featuregate.Alpha},
 }

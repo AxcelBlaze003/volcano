@@ -18,6 +18,7 @@ package api
 
 import (
 	"log"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -58,9 +59,9 @@ func TestHyperNodesInfo_UpdateHyperNode_Normal(t *testing.T) {
 			name:              "update successfully",
 			initialHyperNodes: initialHyperNodes,
 			expectedHyperNodesInfo: map[string]string{
-				"s0": "Name: s0, Tier: 1, Parent: s2",
-				"s1": "Name: s1, Tier: 1, Parent: s2",
-				"s2": "Name: s2, Tier: 2, Parent: ",
+				"s0": "Name: s0, Tier: 1, TierName: , Parent: s2",
+				"s1": "Name: s1, Tier: 1, TierName: , Parent: s2",
+				"s2": "Name: s2, Tier: 2, TierName: , Parent: ",
 			},
 			expectedRealNodesSet: map[string]sets.Set[string]{
 				"s0": sets.New[string]("node-0", "node-1"),
@@ -93,6 +94,152 @@ func TestHyperNodesInfo_UpdateHyperNode_Normal(t *testing.T) {
 			assert.Equal(t, tt.ready, hni.Ready())
 		})
 	}
+}
+
+func TestHyperNodesInfo_UpdateHyperNode_NoSpecChange(t *testing.T) {
+	// Exact-match HyperNode: realNodesSet is purely spec-driven, so an unchanged
+	// spec (only metadata changed) must NOT trigger a rebuild.
+	selector := "exact"
+	s0 := BuildHyperNode("s0", 1, []MemberConfig{{"node-0", topologyv1alpha1.MemberTypeNode, selector, nil}})
+	hyperNodes := map[string]*HyperNodeInfo{
+		"s0": NewHyperNodeInfo(s0),
+	}
+	hyperNodesSetByTier := map[int]sets.Set[string]{
+		1: sets.New[string]("s0"),
+	}
+	realNodesSet := map[string]sets.Set[string]{
+		"s0": sets.New[string]("node-0"),
+	}
+	ready := new(atomic.Bool)
+	ready.Store(false)
+	hni := NewHyperNodesInfoWithCache(hyperNodes, hyperNodesSetByTier, realNodesSet, ready)
+
+	updated := s0.DeepCopy()
+	updated.Labels = map[string]string{"env": "test"}
+
+	err := hni.UpdateHyperNode(updated)
+	assert.NoError(t, err)
+	// ready must remain unchanged (no rebuild happened).
+	assert.False(t, hni.Ready())
+	assert.Equal(t, realNodesSet, hni.realNodesSet)
+	assert.Equal(t, hyperNodesSetByTier, hni.hyperNodesSetByTier)
+	assert.Equal(t, "test", hni.hyperNodes["s0"].HyperNode.Labels["env"])
+}
+
+func TestHyperNodesInfoGeneration(t *testing.T) {
+	informerFactory := informers.NewSharedInformerFactory(fakeclientset.NewClientset(), 0)
+	hni := NewHyperNodesInfo(informerFactory.Core().V1().Nodes().Lister())
+
+	s0 := BuildHyperNode("s0", 1, []MemberConfig{{"node-0", topologyv1alpha1.MemberTypeNode, "exact", nil}})
+	assert.NoError(t, hni.UpdateHyperNode(s0))
+	assert.Equal(t, uint64(1), hni.Generation())
+
+	// Metadata-only updates do not change the effective topology.
+	metadataOnly := s0.DeepCopy()
+	metadataOnly.Labels = map[string]string{"env": "test"}
+	assert.NoError(t, hni.UpdateHyperNode(metadataOnly))
+	assert.Equal(t, uint64(1), hni.Generation())
+
+	membersChanged := BuildHyperNode("s0", 1, []MemberConfig{
+		{"node-0", topologyv1alpha1.MemberTypeNode, "exact", nil},
+		{"node-1", topologyv1alpha1.MemberTypeNode, "exact", nil},
+	})
+	assert.NoError(t, hni.UpdateHyperNode(membersChanged))
+	assert.Equal(t, uint64(2), hni.Generation())
+
+	assert.NoError(t, hni.DeleteHyperNode("s0"))
+	assert.Equal(t, uint64(3), hni.Generation())
+}
+
+func TestHyperNodesInfo_UpdateHyperNode_RegexMember_AlwaysRebuilds(t *testing.T) {
+	// Regex-match HyperNode: even if the spec is unchanged, a rebuild must happen
+	// because the matching node set depends on current cluster state (node add/delete).
+	s0 := BuildHyperNode("s0", 1, []MemberConfig{{"node-.*", topologyv1alpha1.MemberTypeNode, "regex", nil}})
+
+	informerFactory := informers.NewSharedInformerFactory(fakeclientset.NewClientset(), 0)
+	nodeLister := informerFactory.Core().V1().Nodes().Lister()
+	hni := NewHyperNodesInfo(nodeLister)
+
+	err := hni.UpdateHyperNode(s0)
+	assert.NoError(t, err)
+	// No real nodes in the lister yet → realNodesSet for s0 is empty/absent.
+	assert.True(t, hni.Ready())
+	assert.Equal(t, uint64(1), hni.Generation())
+
+	// Same spec, but calling UpdateHyperNode again must still rebuild (node state may differ).
+	err = hni.UpdateHyperNode(s0.DeepCopy())
+	assert.NoError(t, err)
+	assert.True(t, hni.Ready())
+	assert.Equal(t, uint64(1), hni.Generation(), "an unchanged resolved node set must not advance generation")
+
+	node := buildNode("node-0", nil, nil)
+	assert.NoError(t, informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node))
+	err = hni.UpdateHyperNode(s0.DeepCopy())
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(2), hni.Generation())
+	assert.Equal(t, sets.New("node-0"), hni.realNodesSet["s0"])
+
+	// Rebuilding again with the same effective membership stays on the cheap
+	// path for the next scheduling session.
+	err = hni.UpdateHyperNode(s0.DeepCopy())
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(2), hni.Generation())
+
+	assert.NoError(t, informerFactory.Core().V1().Nodes().Informer().GetIndexer().Delete(node))
+	err = hni.UpdateHyperNode(s0.DeepCopy())
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(3), hni.Generation())
+	assert.Empty(t, hni.realNodesSet["s0"])
+}
+
+func TestHyperNodesInfo_UpdateHyperNode_TierOnlyChange(t *testing.T) {
+	selector := "exact"
+	s0 := BuildHyperNode("s0", 1, []MemberConfig{{"node-0", topologyv1alpha1.MemberTypeNode, selector, nil}})
+	hyperNodes := map[string]*HyperNodeInfo{
+		"s0": NewHyperNodeInfo(s0),
+	}
+	hyperNodesSetByTier := map[int]sets.Set[string]{
+		1: sets.New[string]("s0"),
+	}
+	realNodesSet := map[string]sets.Set[string]{
+		"s0": sets.New[string]("node-0"),
+	}
+	ready := new(atomic.Bool)
+	ready.Store(false)
+	hni := NewHyperNodesInfoWithCache(hyperNodes, hyperNodesSetByTier, realNodesSet, ready)
+
+	updated := s0.DeepCopy()
+	updated.Spec.Tier = 2
+
+	err := hni.UpdateHyperNode(updated)
+	assert.NoError(t, err)
+	assert.False(t, hni.Ready())
+	assert.Equal(t, realNodesSet, hni.realNodesSet)
+	assert.Equal(t, map[int]sets.Set[string]{2: sets.New[string]("s0")}, hni.hyperNodesSetByTier)
+	assert.Equal(t, 2, hni.hyperNodes["s0"].tier)
+}
+
+func TestHyperNodesInfo_UpdateHyperNode_MembersChangeTriggersRebuild(t *testing.T) {
+	selector := "exact"
+	s0 := BuildHyperNode("s0", 1, []MemberConfig{{"node-0", topologyv1alpha1.MemberTypeNode, selector, nil}})
+
+	informerFactory := informers.NewSharedInformerFactory(fakeclientset.NewClientset(), 0)
+	nodeLister := informerFactory.Core().V1().Nodes().Lister()
+	hni := NewHyperNodesInfo(nodeLister)
+
+	err := hni.UpdateHyperNode(s0)
+	assert.NoError(t, err)
+	assert.Equal(t, sets.New[string]("node-0"), hni.realNodesSet["s0"])
+
+	updated := BuildHyperNode("s0", 1, []MemberConfig{
+		{"node-0", topologyv1alpha1.MemberTypeNode, selector, nil},
+		{"node-1", topologyv1alpha1.MemberTypeNode, selector, nil},
+	})
+
+	err = hni.UpdateHyperNode(updated)
+	assert.NoError(t, err)
+	assert.True(t, hni.Ready())
+	assert.Equal(t, sets.New[string]("node-0", "node-1"), hni.realNodesSet["s0"])
 }
 
 func TestHyperNodesInfo_UpdateHyperNode_WithCycle(t *testing.T) {
@@ -133,10 +280,10 @@ func TestHyperNodesInfo_UpdateHyperNode_WithCycle(t *testing.T) {
 				"s3": sets.New[string]("node-0", "node-1"),
 			},
 			expectedHyperNodesInfo: map[string]string{
-				"s0": "Name: s0, Tier: 1, Parent: s1",
-				"s1": "Name: s1, Tier: 2, Parent: s2",
-				"s2": "Name: s2, Tier: 3, Parent: s3",
-				"s3": "Name: s3, Tier: 4, Parent: ",
+				"s0": "Name: s0, Tier: 1, TierName: , Parent: s1",
+				"s1": "Name: s1, Tier: 2, TierName: , Parent: s2",
+				"s2": "Name: s2, Tier: 3, TierName: , Parent: s3",
+				"s3": "Name: s3, Tier: 4, TierName: , Parent: ",
 			},
 			expectError: true,
 		},
@@ -199,7 +346,6 @@ func TestHyperNodesInfo_UpdateHyperNode_MultipleParents(t *testing.T) {
 	tests := []struct {
 		name                   string
 		initialHyperNodes      []*topologyv1alpha1.HyperNode
-		correctHyperNode       *topologyv1alpha1.HyperNode
 		expectedRealNodesSet   map[string]sets.Set[string]
 		expectedHyperNodesInfo map[string]string
 		expectError            bool
@@ -207,16 +353,15 @@ func TestHyperNodesInfo_UpdateHyperNode_MultipleParents(t *testing.T) {
 		{
 			name:              "multi parents",
 			initialHyperNodes: initialHyperNodes,
-			correctHyperNode:  s22,
 			expectedRealNodesSet: map[string]sets.Set[string]{
 				"s0": sets.New[string]("node-0", "node-1"),
 				"s1": sets.New[string]("node-0", "node-1"),
 				"s2": sets.New[string]("node-0", "node-1"),
 			},
 			expectedHyperNodesInfo: map[string]string{
-				"s0": "Name: s0, Tier: 1, Parent: s1",
-				"s1": "Name: s1, Tier: 2, Parent: s2",
-				"s2": "Name: s2, Tier: 3, Parent: ",
+				"s0": "Name: s0, Tier: 1, TierName: , Parent: s1",
+				"s1": "Name: s1, Tier: 2, TierName: , Parent: s2",
+				"s2": "Name: s2, Tier: 3, TierName: , Parent: ",
 			},
 			expectError: true,
 		},
@@ -238,7 +383,6 @@ func TestHyperNodesInfo_UpdateHyperNode_MultipleParents(t *testing.T) {
 				}
 			}
 			assert.Equal(t, false, hni.Ready())
-
 			log.Println("begin update...")
 			// update and resolve multi parents.
 			err := hni.UpdateHyperNode(s22)
@@ -567,36 +711,36 @@ func TestHyperNodesInfo_GetAncestors(t *testing.T) {
 func TestGetLCAHyperNode(t *testing.T) {
 	selector := "exact"
 	hnim := HyperNodeInfoMap{
-		"s0": {parent: "s4", tier: 1, HyperNode: BuildHyperNode("s0", 1, []MemberConfig{
+		"s0": {Parent: "s4", tier: 1, HyperNode: BuildHyperNode("s0", 1, []MemberConfig{
 			{"node-0", topologyv1alpha1.MemberTypeNode, selector, nil},
 			{"node-1", topologyv1alpha1.MemberTypeNode, selector, nil},
 		})},
-		"s1": {parent: "s4", tier: 1, HyperNode: BuildHyperNode("s1", 1, []MemberConfig{
+		"s1": {Parent: "s4", tier: 1, HyperNode: BuildHyperNode("s1", 1, []MemberConfig{
 			{"node-2", topologyv1alpha1.MemberTypeNode, selector, nil},
 			{"node-3", topologyv1alpha1.MemberTypeNode, selector, nil},
 		})},
-		"s2": {parent: "s5", tier: 1, HyperNode: BuildHyperNode("s2", 1, []MemberConfig{
+		"s2": {Parent: "s5", tier: 1, HyperNode: BuildHyperNode("s2", 1, []MemberConfig{
 			{"node-4", topologyv1alpha1.MemberTypeNode, selector, nil},
 			{"node-5", topologyv1alpha1.MemberTypeNode, selector, nil},
 		})},
-		"s3": {parent: "s5", tier: 1, HyperNode: BuildHyperNode("s3", 1, []MemberConfig{
+		"s3": {Parent: "s5", tier: 1, HyperNode: BuildHyperNode("s3", 1, []MemberConfig{
 			{"node-6", topologyv1alpha1.MemberTypeNode, selector, nil},
 			{"node-7", topologyv1alpha1.MemberTypeNode, selector, nil},
 		})},
-		"s4": {parent: "s6", tier: 2, HyperNode: BuildHyperNode("s4", 2, []MemberConfig{
+		"s4": {Parent: "s6", tier: 2, HyperNode: BuildHyperNode("s4", 2, []MemberConfig{
 			{"s0", topologyv1alpha1.MemberTypeHyperNode, selector, nil},
 			{"s1", topologyv1alpha1.MemberTypeHyperNode, selector, nil},
 		})},
-		"s5": {parent: "s6", tier: 2, HyperNode: BuildHyperNode("s5", 2, []MemberConfig{
+		"s5": {Parent: "s6", tier: 2, HyperNode: BuildHyperNode("s5", 2, []MemberConfig{
 			{"s2", topologyv1alpha1.MemberTypeHyperNode, selector, nil},
 			{"s3", topologyv1alpha1.MemberTypeHyperNode, selector, nil},
 		})},
-		"s6": {parent: "", tier: 3, HyperNode: BuildHyperNode("s6", 3, []MemberConfig{
+		"s6": {Parent: "", tier: 3, HyperNode: BuildHyperNode("s6", 3, []MemberConfig{
 			{"s4", topologyv1alpha1.MemberTypeHyperNode, selector, nil},
 			{"s5", topologyv1alpha1.MemberTypeHyperNode, selector, nil},
 		})},
 		// s-orphan is an orphan hypernode that does not have parent
-		"s-orphan": {parent: "", tier: 1, HyperNode: BuildHyperNode("s-orphan", 1, []MemberConfig{
+		"s-orphan": {Parent: "", tier: 1, HyperNode: BuildHyperNode("s-orphan", 1, []MemberConfig{
 			{"node-8", topologyv1alpha1.MemberTypeNode, selector, nil},
 			{"node-9", topologyv1alpha1.MemberTypeNode, selector, nil},
 		})},

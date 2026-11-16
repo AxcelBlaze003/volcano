@@ -28,30 +28,58 @@ import (
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
-
-	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumebinding"
 
-	scheduling "volcano.sh/volcano/pkg/scheduler/capabilities/volumebinding"
+	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
 // Framework is a K8S framework who mainly provides some methods
 // about snapshot and plugins such as predicates
 type Framework struct {
-	snapshot         framework.SharedLister
+	snapshot         *Snapshot
 	kubeClient       kubernetes.Interface
 	informerFactory  informers.SharedInformerFactory
-	sharedDRAManager framework.SharedDRAManager
+	sharedDRAManager fwk.SharedDRAManager
+	sharedCSIManager fwk.CSIManager
 }
 
-var _ framework.Handle = &Framework{}
+var _ fwk.Handle = &Framework{}
 
 type Option func(*Framework)
 
 // WithSharedDRAManager sets the shared DRAManager for the framework
-func WithSharedDRAManager(sharedDRAManager framework.SharedDRAManager) Option {
+func WithSharedDRAManager(sharedDRAManager fwk.SharedDRAManager) Option {
 	return func(f *Framework) {
 		f.sharedDRAManager = sharedDRAManager
+	}
+}
+
+// WithSharedCSIManager sets the shared CSIManager for the framework
+func WithSharedCSIManager(sharedCSIManager fwk.CSIManager) Option {
+	return func(f *Framework) {
+		f.sharedCSIManager = sharedCSIManager
+	}
+}
+
+// WithSnapshotSharedLister sets the SharedLister of the snapshot.
+func WithSnapshotSharedLister(snapshot *Snapshot) Option {
+	return func(o *Framework) {
+		o.snapshot = snapshot
+	}
+}
+
+// WithClientSet sets clientSet for the scheduling frameworkImpl.
+func WithClientSet(clientSet kubernetes.Interface) Option {
+	return func(o *Framework) {
+		o.kubeClient = clientSet
+	}
+}
+
+// WithInformerFactory sets informer factory for the scheduling frameworkImpl.
+func WithInformerFactory(informerFactory informers.SharedInformerFactory) Option {
+	return func(o *Framework) {
+		o.informerFactory = informerFactory
 	}
 }
 
@@ -59,17 +87,17 @@ func WithSharedDRAManager(sharedDRAManager framework.SharedDRAManager) Option {
 // snapshot. The snapshot is taken at the beginning of a scheduling cycle and remains
 // unchanged until a pod finishes "Reserve". There is no guarantee that the information
 // remains unchanged after "Reserve".
-func (f *Framework) SnapshotSharedLister() framework.SharedLister {
+func (f *Framework) SnapshotSharedLister() fwk.SharedLister {
 	return f.snapshot
 }
 
 // IterateOverWaitingPods acquires a read lock and iterates over the WaitingPods map.
-func (f *Framework) IterateOverWaitingPods(callback func(framework.WaitingPod)) {
+func (f *Framework) IterateOverWaitingPods(callback func(fwk.WaitingPod)) {
 	panic("not implemented")
 }
 
 // GetWaitingPod returns a reference to a WaitingPod given its UID.
-func (f *Framework) GetWaitingPod(uid types.UID) framework.WaitingPod {
+func (f *Framework) GetWaitingPod(uid types.UID) fwk.WaitingPod {
 	panic("not implemented")
 }
 
@@ -100,16 +128,16 @@ func (f *Framework) SharedInformerFactory() informers.SharedInformerFactory {
 }
 
 // VolumeBinder returns the volume binder used by scheduler.
-func (f *Framework) VolumeBinder() scheduling.SchedulerVolumeBinder {
+func (f *Framework) VolumeBinder() volumebinding.SchedulerVolumeBinder {
 	panic("not implemented")
 }
 
 // EventRecorder was introduced in k8s v1.19.6 and to be implemented
-func (f *Framework) EventRecorder() events.EventRecorder {
+func (f *Framework) EventRecorder() events.EventRecorderLogger {
 	return nil
 }
 
-func (f *Framework) AddNominatedPod(logger klog.Logger, pod fwk.PodInfo, nominatingInfo *framework.NominatingInfo) {
+func (f *Framework) AddNominatedPod(logger klog.Logger, pod fwk.PodInfo, nominatingInfo *fwk.NominatingInfo) {
 	panic("implement me")
 }
 
@@ -129,11 +157,19 @@ func (f *Framework) RunPreScorePlugins(ctx context.Context, state fwk.CycleState
 	panic("implement me")
 }
 
-func (f *Framework) RunScorePlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeinfos []fwk.NodeInfo) ([]framework.NodePluginScores, *fwk.Status) {
+func (f *Framework) RunScorePlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeinfos []fwk.NodeInfo) ([]fwk.NodePluginScores, *fwk.Status) {
 	panic("implement me")
 }
 
 func (f *Framework) RunFilterPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, info fwk.NodeInfo) *fwk.Status {
+	panic("implement me")
+}
+
+func (f *Framework) RunReservePluginsReserve(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string) *fwk.Status {
+	panic("implement me")
+}
+
+func (f *Framework) RunReservePluginsUnreserve(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string) {
 	panic("implement me")
 }
 
@@ -149,6 +185,14 @@ func (f *Framework) RejectWaitingPod(uid types.UID) bool {
 	panic("implement me")
 }
 
+func (f *Framework) AddPodInPreBind(uid types.UID, cancel context.CancelCauseFunc) {}
+
+func (f *Framework) GetPodInPreBind(uid types.UID) fwk.PodInPreBind {
+	return nil
+}
+
+func (f *Framework) RemovePodInPreBind(uid types.UID) {}
+
 func (f *Framework) KubeConfig() *rest.Config {
 	panic("implement me")
 }
@@ -157,11 +201,11 @@ func (f *Framework) RunFilterPluginsWithNominatedPods(ctx context.Context, state
 	panic("implement me")
 }
 
-func (f *Framework) Extenders() []framework.Extender {
+func (f *Framework) Extenders() []fwk.Extender {
 	panic("implement me")
 }
 
-func (f *Framework) Parallelizer() parallelize.Parallelizer {
+func (f *Framework) Parallelizer() fwk.Parallelizer {
 	return parallelize.NewParallelizer(16)
 }
 
@@ -169,11 +213,11 @@ func (f *Framework) Activate(logger klog.Logger, pods map[string]*v1.Pod) {
 	panic("implement me")
 }
 
-func (f *Framework) SharedDRAManager() framework.SharedDRAManager {
+func (f *Framework) SharedDRAManager() fwk.SharedDRAManager {
 	return f.sharedDRAManager
 }
 
-func (f *Framework) APICacher() framework.APICacher {
+func (f *Framework) APICacher() fwk.APICacher {
 	return nil
 }
 
@@ -181,17 +225,48 @@ func (f *Framework) APIDispatcher() fwk.APIDispatcher {
 	return nil
 }
 
-// NewFrameworkHandle creates a FrameworkHandle interface, which is used by k8s plugins.
-func NewFrameworkHandle(nodeMap map[string]fwk.NodeInfo, client kubernetes.Interface, informerFactory informers.SharedInformerFactory, opts ...Option) framework.Handle {
-	snapshot := NewSnapshot(nodeMap)
-	fw := &Framework{
-		snapshot:        snapshot,
-		kubeClient:      client,
-		informerFactory: informerFactory,
-	}
+func (f *Framework) ProfileName() string {
+	return ""
+}
+
+func (f *Framework) SharedCSIManager() fwk.CSIManager {
+	return f.sharedCSIManager
+}
+
+func (f *Framework) PodGroupManager() fwk.PodGroupManager {
+	return nil
+}
+
+func (f *Framework) MutableSnapshotSharedLister() fwk.MutableSnapshotSharedLister {
+	return nil
+}
+
+func (f *Framework) SignPod(ctx context.Context, pod *v1.Pod) fwk.PodSignature {
+	return nil
+}
+
+// VolcanoNodeInfos returns a list of volcano NodeInfo.
+func (f *Framework) VolcanoNodeInfos() []*api.NodeInfo {
+	return f.snapshot.VolcanoNodeInfos()
+}
+
+// GetVolcanoNodeInfo returns the volcano NodeInfo of the given node name.
+func (f *Framework) GetVolcanoNodeInfo(nodeName string) (*api.NodeInfo, error) {
+	return f.snapshot.GetVolcanoNodeInfo(nodeName)
+}
+
+// NewFramework is the constructor of Framework
+func NewFramework(nodeMap map[string]fwk.NodeInfo, opts ...Option) *Framework {
+	fw := &Framework{}
 
 	for _, opt := range opts {
 		opt(fw)
+	}
+
+	// If no snapshot is provided, create a new one with the given nodeMap, it's mainly used in volcano batch scheduler(session scheduling).
+	if fw.snapshot == nil {
+		snapshot := NewSnapshot(nodeMap)
+		fw.snapshot = snapshot
 	}
 
 	return fw

@@ -20,6 +20,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	whv1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
 	"volcano.sh/apis/pkg/client/clientset/versioned"
@@ -35,8 +36,18 @@ type AdmissionServiceConfig struct {
 	KubeClient     kubernetes.Interface
 	VolcanoClient  versioned.Interface
 	QueueLister    schedulinglister.QueueLister
-	Recorder       record.EventRecorder
-	ConfigData     *config.AdmissionConfiguration
+	QueueInformer  cache.SharedIndexInformer
+	// NamespaceQueueLister reads NamespaceQueue objects from the shared cache.
+	NamespaceQueueLister schedulinglister.NamespaceQueueLister
+	// NamespaceQueueInformer provides indexed NamespaceQueue lookups.
+	NamespaceQueueInformer        cache.SharedIndexInformer
+	Recorder                      record.EventRecorder
+	ConfigData                    *config.AdmissionConfiguration
+	EnableQueueAllocatedPodsCheck bool
+	MaxQueueDepth                 int
+	// MaxNamespaceQueueDepth limits NamespaceQueue descendants below a cluster Queue.
+	MaxNamespaceQueueDepth    int
+	EnableRootQueueProtection bool
 }
 
 type AdmissionService struct {

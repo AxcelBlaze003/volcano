@@ -81,8 +81,9 @@ network_closure.sh
 /_tmp/
 /doc_tmp/
 
-# Test artifacts produced by Jenkins jobs
+# Test artifacts
 /_artifacts/
+/test-artifacts/
 
 # Go dependencies installed on Jenkins
 /_gopath/
@@ -139,3 +140,15 @@ vendor
 
 # helm dependency files
 installer/helm/chart/volcano/requirements.lock
+
+# benchmark result dir
+benchmark/results/
+
+# benchmark generated kind config (rendered from kind-config.yaml at runtime)
+benchmark/config/.kind-config.rendered.yaml
+
+# benchmark audit log output (written by kube-apiserver, consumed by audit-exporter)
+benchmark/logs/
+
+# benchmark kubeconfig exported by kind
+benchmark/kubeconfig

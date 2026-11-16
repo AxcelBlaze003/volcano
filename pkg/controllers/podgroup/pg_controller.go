@@ -132,7 +132,7 @@ func (pg *pgcontroller) Run(stopCh <-chan struct{}) {
 		}
 	}
 
-	for i := 0; i < int(pg.workers); i++ {
+	for range int(pg.workers) {
 		go wait.Until(pg.worker, 0, stopCh)
 	}
 
@@ -156,6 +156,10 @@ func (pg *pgcontroller) processNextReq() bool {
 	pod, err := pg.podLister.Pods(req.podNamespace).Get(req.podName)
 	if err != nil {
 		klog.Errorf("Failed to get pod by <%v> from cache: %v", req, err)
+		return true
+	}
+	if pod.UID != req.podUID {
+		klog.V(5).Infof("pod %v/%v UID is not matched, maybe pod has been recreated, skip it", pod.Namespace, pod.Name)
 		return true
 	}
 

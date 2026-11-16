@@ -26,15 +26,189 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/ptr"
 
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	schedulingapi "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
 	"volcano.sh/volcano/pkg/controllers/apis"
 	"volcano.sh/volcano/pkg/controllers/job/state"
+	"volcano.sh/volcano/pkg/features"
 )
+
+func TestGetJobForwardingQueue(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NamespaceQueue, true)
+	controller := newFakeController()
+	for _, queue := range []*schedulingapi.Queue{
+		{ObjectMeta: metav1.ObjectMeta{Name: schedulingapi.DefaultQueue}},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "research"},
+			Spec: schedulingapi.QueueSpec{
+				ExtendClusters: []schedulingapi.Cluster{{Name: "remote"}},
+			},
+		},
+	} {
+		if err := controller.queueInformer.Informer().GetIndexer().Add(queue); err != nil {
+			t.Fatalf("failed to add Queue to indexer: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name          string
+		job           *v1alpha1.Job
+		wantQueueName string
+		wantErr       bool
+	}{
+		{
+			name: "cluster Queue provides forwarding configuration",
+			job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "team-a"},
+				Spec:       v1alpha1.JobSpec{Queue: "research"},
+			},
+			wantQueueName: "research",
+		},
+		{
+			name: "NamespaceQueue does not use cluster forwarding",
+			job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "team-a"},
+				Spec:       v1alpha1.JobSpec{Queue: "namespace/training"},
+			},
+		},
+		{
+			name: "empty reference resolves to default Queue",
+			job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "team-a"},
+			},
+			wantQueueName: schedulingapi.DefaultQueue,
+		},
+		{
+			name: "malformed reference is rejected",
+			job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "team-a"},
+				Spec:       v1alpha1.JobSpec{Queue: "namespace/team/training"},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "nil Job is rejected",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			queue, err := controller.getJobForwardingQueue(tt.job)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("getJobForwardingQueue() error = %v, wantErr %t", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if tt.wantQueueName == "" {
+				if queue != nil {
+					t.Fatalf("getJobForwardingQueue() = %q, want nil", queue.Name)
+				}
+				return
+			}
+			if queue == nil || queue.Name != tt.wantQueueName {
+				t.Fatalf("getJobForwardingQueue() = %#v, want %q", queue, tt.wantQueueName)
+			}
+		})
+	}
+}
+
+func TestSyncJobWithNamespaceQueue(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NamespaceQueue, true)
+
+	const (
+		namespace      = "team-a"
+		jobName        = "training-job"
+		queueReference = "namespace/training"
+	)
+	job := &v1alpha1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            jobName,
+			Namespace:       namespace,
+			UID:             "e7f18111-1cec-11ea-b688-fa163ec79500",
+			ResourceVersion: "100",
+		},
+		Spec: v1alpha1.JobSpec{
+			Queue: queueReference,
+			Tasks: []v1alpha1.TaskSpec{{
+				Name:     "worker",
+				Replicas: 1,
+				Template: v1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{v1alpha1.QueueNameKey: "stale-queue"},
+					},
+					Spec: v1.PodSpec{Containers: []v1.Container{{Name: "worker"}}},
+				},
+			}},
+		},
+		Status: v1alpha1.JobStatus{State: v1alpha1.JobState{Phase: v1alpha1.Pending}},
+	}
+	podGroup := &schedulingapi.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      job.Name + "-" + string(job.UID),
+			Namespace: namespace,
+		},
+		Spec: schedulingapi.PodGroupSpec{
+			Queue:         queueReference,
+			MinResources:  &v1.ResourceList{},
+			MinTaskMember: map[string]int32{"worker": 1},
+		},
+		Status: schedulingapi.PodGroupStatus{Phase: schedulingapi.PodGroupInqueue},
+	}
+
+	controller := newFakeController()
+	if err := controller.pgInformer.Informer().GetIndexer().Add(podGroup); err != nil {
+		t.Fatalf("failed to add PodGroup to indexer: %v", err)
+	}
+	if _, err := controller.vcClient.SchedulingV1beta1().PodGroups(namespace).Create(
+		context.Background(), podGroup, metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("failed to create PodGroup: %v", err)
+	}
+	if _, err := controller.vcClient.BatchV1alpha1().Jobs(namespace).Create(
+		context.Background(), job, metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("failed to create Job: %v", err)
+	}
+	if err := controller.cache.Add(job); err != nil {
+		t.Fatalf("failed to add Job to cache: %v", err)
+	}
+
+	jobInfo := &apis.JobInfo{
+		Job:       job,
+		Namespace: namespace,
+		Name:      jobName,
+		Pods:      map[string]map[string]*v1.Pod{},
+	}
+	if err := controller.syncJob(jobInfo, nil); err != nil {
+		t.Fatalf("failed to sync NamespaceQueue Job: %v", err)
+	}
+
+	pods, err := controller.kubeClient.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list Pods: %v", err)
+	}
+	if len(pods.Items) != 1 {
+		t.Fatalf("got %d Pods, want 1", len(pods.Items))
+	}
+	pod := &pods.Items[0]
+	if got := pod.Annotations[v1alpha1.QueueNameKey]; got != queueReference {
+		t.Errorf("queue annotation = %q, want %q", got, queueReference)
+	}
+	if got, found := pod.Labels[v1alpha1.QueueNameKey]; found {
+		t.Errorf("queue label = %q, want label omitted for NamespaceQueue reference", got)
+	}
+}
 
 func TestKillJobFunc(t *testing.T) {
 	namespace := "test"
@@ -184,7 +358,7 @@ func TestKillJobFunc(t *testing.T) {
 				}
 			}
 
-			_, err := fakeController.vcClient.BatchV1alpha1().Jobs(namespace).Create(context.TODO(), testcase.Job, metav1.CreateOptions{})
+			_, err := fakeController.vcClient.BatchV1alpha1().Jobs(namespace).Create(context.TODO(), testJobUID(testcase.Job), metav1.CreateOptions{})
 			if err != nil {
 				t.Error("Error While Creating Jobs")
 			}
@@ -438,6 +612,7 @@ func TestSyncJobFunc(t *testing.T) {
 			testcase.JobInfo.Job = testcase.Job
 			testcase.JobInfo.Job.Spec.Plugins = jobPlugins
 
+			testcase.PodGroup.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(testJobUID(testcase.Job), v1alpha1.SchemeGroupVersion.WithKind("Job"))}
 			fakeController.pgInformer.Informer().GetIndexer().Add(testcase.PodGroup)
 			fakeController.vcClient.SchedulingV1beta1().PodGroups(testcase.PodGroup.Namespace).Create(context.TODO(), testcase.PodGroup, metav1.CreateOptions{})
 
@@ -448,7 +623,7 @@ func TestSyncJobFunc(t *testing.T) {
 				}
 			}
 
-			_, err := fakeController.vcClient.BatchV1alpha1().Jobs(namespace).Create(context.TODO(), testcase.Job, metav1.CreateOptions{})
+			_, err := fakeController.vcClient.BatchV1alpha1().Jobs(namespace).Create(context.TODO(), testJobUID(testcase.Job), metav1.CreateOptions{})
 			if err != nil {
 				t.Errorf("Expected no Error while creating job, but got error: %s", err)
 			}
@@ -571,9 +746,10 @@ func TestCreatePodGroupIfNotExistFunc(t *testing.T) {
 	highestTierAllowed := 1
 
 	testcases := []struct {
-		Name      string
-		Job       *v1alpha1.Job
-		ExpextVal error
+		Name                string
+		Job                 *v1alpha1.Job
+		ExpectMinTaskMember map[string]int32
+		ExpextVal           error
 	}{
 		{
 			Name: "CreatePodGroup success Case",
@@ -625,7 +801,115 @@ func TestCreatePodGroupIfNotExistFunc(t *testing.T) {
 					},
 				},
 			},
-			ExpextVal: nil,
+			ExpectMinTaskMember: map[string]int32{"task1": 6},
+			ExpextVal:           nil,
+		},
+		{
+			Name: "CreatePodGroup success Case with MinPartitions",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      "job3",
+					UID:       "e7f18111-1cec-11ea-b688-fa163ec79500",
+				},
+				Spec: v1alpha1.JobSpec{
+					SchedulerName: "volcano",
+					Volumes: []v1alpha1.VolumeSpec{
+						{
+							VolumeClaimName: "vc1",
+							VolumeClaim: &v1.PersistentVolumeClaimSpec{
+								VolumeName: "v1",
+							},
+						},
+						{
+							VolumeClaimName: "vc2",
+						},
+					},
+					Tasks: []v1alpha1.TaskSpec{
+						{
+							Name:     "task1",
+							Replicas: 6,
+							PartitionPolicy: &v1alpha1.PartitionPolicySpec{
+								TotalPartitions: 2,
+								PartitionSize:   3,
+								MinPartitions:   1,
+								NetworkTopology: &v1alpha1.NetworkTopologySpec{
+									Mode:               "hard",
+									HighestTierAllowed: &highestTierAllowed,
+								},
+							},
+							Template: v1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      "pods",
+									Namespace: namespace,
+								},
+								Spec: v1.PodSpec{
+									Containers: []v1.Container{
+										{
+											Name: "Containers",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ExpectMinTaskMember: map[string]int32{"task1": 3},
+			ExpextVal:           nil,
+		},
+		{
+			Name: "CreatePodGroup success Case with highestTierName",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      "job2",
+					UID:       "e7f18111-1cec-11ea-b688-fa163ec79500",
+				},
+				Spec: v1alpha1.JobSpec{
+					SchedulerName: "volcano",
+					Volumes: []v1alpha1.VolumeSpec{
+						{
+							VolumeClaimName: "vc1",
+							VolumeClaim: &v1.PersistentVolumeClaimSpec{
+								VolumeName: "v1",
+							},
+						},
+						{
+							VolumeClaimName: "vc2",
+						},
+					},
+					Tasks: []v1alpha1.TaskSpec{
+						{
+							Name:     "task1",
+							Replicas: 6,
+							PartitionPolicy: &v1alpha1.PartitionPolicySpec{
+								TotalPartitions: 2,
+								PartitionSize:   3,
+								NetworkTopology: &v1alpha1.NetworkTopologySpec{
+									Mode:            "hard",
+									HighestTierName: "volcano.sh/hypernode",
+								},
+							},
+							Template: v1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      "pods",
+									Namespace: namespace,
+								},
+								Spec: v1.PodSpec{
+									Containers: []v1.Container{
+										{
+											Name: "Containers",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ExpectMinTaskMember: map[string]int32{"task1": 6},
+			ExpextVal:           nil,
 		},
 	}
 
@@ -639,9 +923,12 @@ func TestCreatePodGroupIfNotExistFunc(t *testing.T) {
 			}
 
 			pgName := testcase.Job.Name + "-" + string(testcase.Job.UID)
-			_, err = fakeController.vcClient.SchedulingV1beta1().PodGroups(namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+			pg, err := fakeController.vcClient.SchedulingV1beta1().PodGroups(namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
 			if err != nil {
 				t.Error("Expected PodGroup to get created, but not created")
+			}
+			if !reflect.DeepEqual(pg.Spec.MinTaskMember, testcase.ExpectMinTaskMember) {
+				t.Errorf("Expected PodGroup.Spec.MinTaskMember to be created to: %v, but got: %v", testcase.ExpectMinTaskMember, pg.Spec.MinTaskMember)
 			}
 		})
 
@@ -653,10 +940,11 @@ func TestUpdatePodGroupIfJobUpdateFunc(t *testing.T) {
 	highestTierAllowed := 1
 
 	testcases := []struct {
-		Name      string
-		PodGroup  *schedulingapi.PodGroup
-		Job       *v1alpha1.Job
-		ExpectVal error
+		Name                string
+		PodGroup            *schedulingapi.PodGroup
+		Job                 *v1alpha1.Job
+		ExpectMinTaskMember map[string]int32
+		ExpectVal           error
 	}{
 		{
 			Name: "UpdatePodGroup success Case",
@@ -680,7 +968,8 @@ func TestUpdatePodGroupIfJobUpdateFunc(t *testing.T) {
 					PriorityClassName: "new",
 				},
 			},
-			ExpectVal: nil,
+			ExpectMinTaskMember: map[string]int32{},
+			ExpectVal:           nil,
 		},
 		{
 			Name: "UpdatePodGroup compatibility with version lt 1.5 success Case",
@@ -704,7 +993,8 @@ func TestUpdatePodGroupIfJobUpdateFunc(t *testing.T) {
 					MinResources: &v1.ResourceList{},
 				},
 			},
-			ExpectVal: nil,
+			ExpectMinTaskMember: map[string]int32{},
+			ExpectVal:           nil,
 		},
 		{
 			Name: "UpdatePodGroup compatibility with PartitionPolicy",
@@ -742,13 +1032,94 @@ func TestUpdatePodGroupIfJobUpdateFunc(t *testing.T) {
 					MinResources: &v1.ResourceList{},
 				},
 			},
-			ExpectVal: nil,
+			ExpectMinTaskMember: map[string]int32{"task1": 6},
+			ExpectVal:           nil,
+		},
+		{
+			Name: "UpdatePodGroup compatibility with PartitionPolicy having MinPartitions",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:       namespace,
+					Name:            "job4",
+					ResourceVersion: "100",
+					UID:             "e7f18111-1cec-11ea-b688-fa163ec79500",
+				},
+				Spec: v1alpha1.JobSpec{
+					PriorityClassName: "new",
+					Tasks: []v1alpha1.TaskSpec{
+						{
+							Name:     "task1",
+							Replicas: 6,
+							PartitionPolicy: &v1alpha1.PartitionPolicySpec{
+								TotalPartitions: 2,
+								PartitionSize:   3,
+								MinPartitions:   1,
+								NetworkTopology: &v1alpha1.NetworkTopologySpec{
+									Mode:               "hard",
+									HighestTierAllowed: &highestTierAllowed,
+								},
+							},
+						},
+					},
+				},
+			},
+			PodGroup: &schedulingapi.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      "job4",
+				},
+				Spec: schedulingapi.PodGroupSpec{
+					MinResources: &v1.ResourceList{},
+				},
+			},
+			ExpectMinTaskMember: map[string]int32{"task1": 3},
+			ExpectVal:           nil,
+		},
+		{
+			Name: "UpdatePodGroup compatibility with highestTierName",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:       namespace,
+					Name:            "job4",
+					ResourceVersion: "100",
+					UID:             "e7f18111-1cec-11ea-b688-fa163ec79500",
+				},
+				Spec: v1alpha1.JobSpec{
+					PriorityClassName: "new",
+					Tasks: []v1alpha1.TaskSpec{
+						{
+							Name:     "task1",
+							Replicas: 6,
+							PartitionPolicy: &v1alpha1.PartitionPolicySpec{
+								TotalPartitions: 2,
+								PartitionSize:   3,
+								NetworkTopology: &v1alpha1.NetworkTopologySpec{
+									Mode:            "hard",
+									HighestTierName: "volcano.sh/hypernode",
+								},
+							},
+						},
+					},
+				},
+			},
+			PodGroup: &schedulingapi.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      "job4",
+				},
+				Spec: schedulingapi.PodGroupSpec{
+					MinResources: &v1.ResourceList{},
+				},
+			},
+			ExpectMinTaskMember: map[string]int32{"task1": 6},
+			ExpectVal:           nil,
 		},
 	}
 
 	for _, testcase := range testcases {
 		t.Run(testcase.Name, func(t *testing.T) {
 			fakeController := newFakeController()
+			testcase.PodGroup.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(testJobUID(testcase.Job), v1alpha1.SchemeGroupVersion.WithKind("Job"))}
 			fakeController.pgInformer.Informer().GetIndexer().Add(testcase.PodGroup)
 			fakeController.vcClient.SchedulingV1beta1().PodGroups(testcase.PodGroup.Namespace).Create(context.TODO(), testcase.PodGroup, metav1.CreateOptions{})
 
@@ -766,7 +1137,9 @@ func TestUpdatePodGroupIfJobUpdateFunc(t *testing.T) {
 			if pg.Spec.PriorityClassName != testcase.Job.Spec.PriorityClassName {
 				t.Errorf("Expected PodGroup.Spec.PriorityClassName to be updated to: %s, but got: %s", testcase.Job.Spec.PriorityClassName, pg.Spec.PriorityClassName)
 			}
-
+			if !reflect.DeepEqual(pg.Spec.MinTaskMember, testcase.ExpectMinTaskMember) {
+				t.Errorf("Expected PodGroup.Spec.MinTaskMember to be updated: %v, but got: %v", testcase.ExpectMinTaskMember, pg.Spec.MinTaskMember)
+			}
 		})
 
 	}
@@ -1131,7 +1504,7 @@ func TestPodsToKill(t *testing.T) {
 			}
 
 			// Create job
-			_, err := fakeController.vcClient.BatchV1alpha1().Jobs(namespace).Create(context.TODO(), testcase.Job, metav1.CreateOptions{})
+			_, err := fakeController.vcClient.BatchV1alpha1().Jobs(namespace).Create(context.TODO(), testJobUID(testcase.Job), metav1.CreateOptions{})
 			if err != nil {
 				t.Fatalf("Error while creating job: %v", err)
 			}
@@ -1141,6 +1514,7 @@ func TestPodsToKill(t *testing.T) {
 				t.Fatalf("Error while adding job to cache: %v", err)
 			}
 
+			testJobUID(testcase.JobInfo.Job)
 			// Execute killPods
 			err = fakeController.killPods(testcase.JobInfo, testcase.PodRetainPhase, testcase.Target, testcase.UpdateStatus)
 			if !errors.Is(err, testcase.ExpectVal) {
@@ -1159,6 +1533,465 @@ func TestPodsToKill(t *testing.T) {
 				} else if !shouldExist && err == nil {
 					t.Errorf("Test case %d (%s): expected pod %s to be deleted, but still exists", i, testcase.Name, podName)
 				}
+			}
+		})
+	}
+}
+
+func TestKillPodsPodGroupDeletion(t *testing.T) {
+	namespace := "test"
+	jobUID := "e7f18111-1cec-11ea-b688-fa163ec79500"
+
+	testcases := []struct {
+		Name               string
+		Target             *state.Target
+		ExpectPodGroupGone bool
+	}{
+		{
+			Name:               "full job kill (target=nil) deletes PodGroup",
+			Target:             nil,
+			ExpectPodGroupGone: true,
+		},
+		{
+			Name: "targeted pod restart (target!=nil) keeps PodGroup",
+			Target: &state.Target{
+				Type:     state.TargetTypePod,
+				TaskName: "task1",
+				PodName:  "pod1",
+			},
+			ExpectPodGroupGone: false,
+		},
+	}
+
+	for _, testcase := range testcases {
+		t.Run(testcase.Name, func(t *testing.T) {
+			job := &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "job1",
+					Namespace:       namespace,
+					UID:             types.UID(jobUID),
+					ResourceVersion: "100",
+				},
+			}
+			pgName := fmt.Sprintf("%s-%s", job.Name, jobUID)
+			pg := &schedulingapi.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      pgName,
+					Namespace: namespace,
+				},
+			}
+			jobInfo := &apis.JobInfo{
+				Namespace: namespace,
+				Name:      job.Name,
+				Job:       job,
+				Pods: map[string]map[string]*v1.Pod{
+					"task1": {
+						"pod1": buildPod(namespace, "pod1", v1.PodRunning, nil),
+					},
+				},
+			}
+
+			fakeController := newFakeController()
+
+			pg.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(testJobUID(job), v1alpha1.SchemeGroupVersion.WithKind("Job"))}
+			fakeController.pgInformer.Informer().GetIndexer().Add(pg)
+			_, err := fakeController.vcClient.SchedulingV1beta1().PodGroups(namespace).Create(context.TODO(), pg, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error creating PodGroup: %v", err)
+			}
+
+			_, err = fakeController.kubeClient.CoreV1().Pods(namespace).Create(context.TODO(), jobInfo.Pods["task1"]["pod1"], metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error creating pod: %v", err)
+			}
+
+			_, err = fakeController.vcClient.BatchV1alpha1().Jobs(namespace).Create(context.TODO(), job, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error creating job: %v", err)
+			}
+			if err = fakeController.cache.Add(job); err != nil {
+				t.Fatalf("Error adding job to cache: %v", err)
+			}
+
+			err = fakeController.killPods(jobInfo, state.PodRetainPhaseNone, testcase.Target, nil)
+			if err != nil {
+				t.Fatalf("killPods returned unexpected error: %v", err)
+			}
+
+			_, pgErr := fakeController.vcClient.SchedulingV1beta1().PodGroups(namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+			pgGone := pgErr != nil && apierrors.IsNotFound(pgErr)
+			if pgGone != testcase.ExpectPodGroupGone {
+				if testcase.ExpectPodGroupGone {
+					t.Errorf("expected PodGroup to be deleted, but it still exists")
+				} else {
+					t.Errorf("expected PodGroup to be kept, but it was deleted")
+				}
+			}
+		})
+	}
+}
+
+func TestGetSubGroupPolicy(t *testing.T) {
+	highestTierAllowed := 1
+
+	testCases := []struct {
+		Name                 string
+		TaskSpec             v1alpha1.TaskSpec
+		ExpectedMinSubGroups *int32
+		ExpectedSubGroupSize *int32
+		Description          string
+	}{
+		{
+			Name: "SubGroupPolicy with MinPartitions set",
+			TaskSpec: v1alpha1.TaskSpec{
+				Name:     "task1",
+				Replicas: 6,
+				PartitionPolicy: &v1alpha1.PartitionPolicySpec{
+					TotalPartitions: 2,
+					MinPartitions:   1,
+					PartitionSize:   3,
+					NetworkTopology: &v1alpha1.NetworkTopologySpec{
+						Mode:               v1alpha1.HardNetworkTopologyMode,
+						HighestTierAllowed: &highestTierAllowed,
+					},
+				},
+			},
+			ExpectedMinSubGroups: ptr.To(int32(1)),
+			ExpectedSubGroupSize: ptr.To(int32(3)),
+			Description:          "MinSubGroups should be set to MinPartitions when MinPartitions > 0",
+		},
+		{
+			Name: "SubGroupPolicy with MinPartitions equal to TotalPartitions",
+			TaskSpec: v1alpha1.TaskSpec{
+				Name:     "task1",
+				Replicas: 9,
+				PartitionPolicy: &v1alpha1.PartitionPolicySpec{
+					TotalPartitions: 3,
+					MinPartitions:   3,
+					PartitionSize:   3,
+				},
+			},
+			ExpectedMinSubGroups: ptr.To(int32(3)),
+			ExpectedSubGroupSize: ptr.To(int32(3)),
+			Description:          "MinSubGroups should equal TotalPartitions when MinPartitions equals TotalPartitions",
+		},
+		{
+			Name: "SubGroupPolicy with MinPartitions not set",
+			TaskSpec: v1alpha1.TaskSpec{
+				Name:     "task1",
+				Replicas: 6,
+				PartitionPolicy: &v1alpha1.PartitionPolicySpec{
+					TotalPartitions: 2,
+					MinPartitions:   0,
+					PartitionSize:   3,
+				},
+			},
+			ExpectedMinSubGroups: ptr.To(int32(0)),
+			ExpectedSubGroupSize: ptr.To(int32(3)),
+			Description:          "MinSubGroups should be nil when MinPartitions is 0",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			result := getSubGroupPolicy(tc.TaskSpec)
+
+			// Check SubGroupSize
+			if tc.ExpectedSubGroupSize != nil {
+				if result.SubGroupSize == nil {
+					t.Errorf("%s: Expected SubGroupSize=%d, got nil",
+						tc.Description, *tc.ExpectedSubGroupSize)
+				} else if *result.SubGroupSize != *tc.ExpectedSubGroupSize {
+					t.Errorf("%s: Expected SubGroupSize=%d, got %d",
+						tc.Description,
+						*tc.ExpectedSubGroupSize,
+						*result.SubGroupSize)
+				}
+			}
+
+			// Check MinSubGroups
+			if tc.ExpectedMinSubGroups != nil {
+				if result.MinSubGroups == nil {
+					t.Errorf("%s: Expected MinSubGroups=%d, got nil",
+						tc.Description, *tc.ExpectedMinSubGroups)
+				} else if *result.MinSubGroups != *tc.ExpectedMinSubGroups {
+					t.Errorf("%s: Expected MinSubGroups=%d, got %d",
+						tc.Description,
+						*tc.ExpectedMinSubGroups,
+						*result.MinSubGroups)
+				}
+			} else {
+				if result.MinSubGroups != nil {
+					t.Errorf("%s: Expected MinSubGroups to be nil, got %d",
+						tc.Description, *result.MinSubGroups)
+				}
+			}
+
+			// Check LabelSelector
+			if result.LabelSelector == nil {
+				t.Errorf("%s: Expected LabelSelector to be set", tc.Description)
+			} else {
+				if result.LabelSelector.MatchLabels == nil {
+					t.Errorf("%s: Expected LabelSelector.MatchLabels to be set", tc.Description)
+				} else if result.LabelSelector.MatchLabels["volcano.sh/task-spec"] != tc.TaskSpec.Name {
+					t.Errorf("%s: Expected LabelSelector.MatchLabels['volcano.sh/task-spec']=%s, got %s",
+						tc.Description,
+						tc.TaskSpec.Name,
+						result.LabelSelector.MatchLabels["volcano.sh/task-spec"])
+				}
+			}
+
+			// Check NetworkTopology
+			if tc.TaskSpec.PartitionPolicy.NetworkTopology != nil {
+				if result.NetworkTopology == nil {
+					t.Errorf("%s: Expected NetworkTopology to be set", tc.Description)
+				}
+			}
+		})
+	}
+}
+
+func TestAppendJobCondition(t *testing.T) {
+	testcases := []struct {
+		Name          string
+		Conditions    []v1alpha1.JobCondition
+		NewCondition  v1alpha1.JobCondition
+		ExpectedLen   int
+		ExpectedPhase v1alpha1.JobPhase
+	}{
+		{
+			Name:       "Append to empty conditions",
+			Conditions: []v1alpha1.JobCondition{},
+			NewCondition: v1alpha1.JobCondition{
+				Status: v1alpha1.Pending,
+			},
+			ExpectedLen:   1,
+			ExpectedPhase: v1alpha1.Pending,
+		},
+		{
+			Name: "Replace existing condition with same phase",
+			Conditions: []v1alpha1.JobCondition{
+				{Status: v1alpha1.Pending},
+				{Status: v1alpha1.Running},
+			},
+			NewCondition: v1alpha1.JobCondition{
+				Status: v1alpha1.Pending,
+			},
+			ExpectedLen:   2,
+			ExpectedPhase: v1alpha1.Pending,
+		},
+		{
+			Name: "Append if phase is different",
+			Conditions: []v1alpha1.JobCondition{
+				{Status: v1alpha1.Pending},
+				{Status: v1alpha1.Running},
+			},
+			NewCondition: v1alpha1.JobCondition{
+				Status: v1alpha1.Completed,
+			},
+			ExpectedLen:   3,
+			ExpectedPhase: v1alpha1.Completed,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.Name, func(t *testing.T) {
+			result := appendJobCondition(tc.Conditions, tc.NewCondition)
+
+			if len(result) != tc.ExpectedLen {
+				t.Errorf("Expected length %d, got %d", tc.ExpectedLen, len(result))
+			}
+
+			if result[len(result)-1].Status != tc.ExpectedPhase {
+				t.Errorf("Expected last phase %v, got %v", tc.ExpectedPhase, result[len(result)-1].Status)
+			}
+		})
+	}
+}
+
+func TestIsDependsOnPodsReady(t *testing.T) {
+	namespace := "test"
+	jobName := "job1"
+
+	testcases := []struct {
+		Name          string
+		Task          string
+		Job           *v1alpha1.Job
+		Pods          []*v1.Pod
+		ExpectedReady bool
+	}{
+		{
+			Name: "DependsOn task has all pods succeeded",
+			Task: "task1",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      jobName,
+					Namespace: namespace,
+				},
+				Spec: v1alpha1.JobSpec{
+					Tasks: []v1alpha1.TaskSpec{
+						{
+							Name:         "task1",
+							Replicas:     2,
+							MinAvailable: ptr.To[int32](2),
+							Template: v1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task1",
+								},
+							},
+						},
+						{
+							Name:     "task2",
+							Replicas: 1,
+							DependsOn: &v1alpha1.DependsOn{
+								Name: []string{"task1"},
+							},
+						},
+					},
+				},
+			},
+			Pods: []*v1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "job1-task1-0",
+						Namespace: namespace,
+					},
+					Status: v1.PodStatus{
+						Phase: v1.PodSucceeded,
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "job1-task1-1",
+						Namespace: namespace,
+					},
+					Status: v1.PodStatus{
+						Phase: v1.PodSucceeded,
+					},
+				},
+			},
+			ExpectedReady: true,
+		},
+		{
+			Name: "DependsOn task has pods running and ready",
+			Task: "task1",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      jobName,
+					Namespace: namespace,
+				},
+				Spec: v1alpha1.JobSpec{
+					Tasks: []v1alpha1.TaskSpec{
+						{
+							Name:         "task1",
+							Replicas:     1,
+							MinAvailable: ptr.To[int32](1),
+							Template: v1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task1",
+								},
+							},
+						},
+						{
+							Name:     "task2",
+							Replicas: 1,
+							DependsOn: &v1alpha1.DependsOn{
+								Name: []string{"task1"},
+							},
+						},
+					},
+				},
+			},
+			Pods: []*v1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "job1-task1-0",
+						Namespace: namespace,
+					},
+					Status: v1.PodStatus{
+						Phase: v1.PodRunning,
+						ContainerStatuses: []v1.ContainerStatus{
+							{Ready: true},
+						},
+					},
+				},
+			},
+			ExpectedReady: true,
+		},
+		{
+			Name: "DependsOn task has pods running but not ready",
+			Task: "task1",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      jobName,
+					Namespace: namespace,
+				},
+				Spec: v1alpha1.JobSpec{
+					Tasks: []v1alpha1.TaskSpec{
+						{
+							Name:         "task1",
+							Replicas:     1,
+							MinAvailable: ptr.To[int32](1),
+							Template: v1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task1",
+								},
+							},
+						},
+						{
+							Name:     "task2",
+							Replicas: 1,
+							DependsOn: &v1alpha1.DependsOn{
+								Name: []string{"task1"},
+							},
+						},
+					},
+				},
+			},
+			Pods: []*v1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "job1-task1-0",
+						Namespace: namespace,
+					},
+					Status: v1.PodStatus{
+						Phase: v1.PodRunning,
+						ContainerStatuses: []v1.ContainerStatus{
+							{Ready: false},
+						},
+					},
+				},
+			},
+			ExpectedReady: false,
+		},
+	}
+
+	for i, tc := range testcases {
+		t.Run(tc.Name, func(t *testing.T) {
+			fakeController := newFakeController()
+
+			_, err := fakeController.vcClient.BatchV1alpha1().Jobs(namespace).Create(context.TODO(), testJobUID(tc.Job), metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Failed to create job: %v", err)
+			}
+			err = fakeController.cache.Add(tc.Job)
+			if err != nil {
+				t.Fatalf("Failed to add job to cache: %v", err)
+			}
+			fakeController.jobInformer.Informer().GetIndexer().Add(tc.Job)
+
+			for _, pod := range tc.Pods {
+				pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(tc.Job, v1alpha1.SchemeGroupVersion.WithKind("Job"))}
+				_, err := fakeController.kubeClient.CoreV1().Pods(namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatalf("Failed to create pod: %v", err)
+				}
+				fakeController.podInformer.Informer().GetIndexer().Add(pod)
+			}
+
+			ready := fakeController.isDependsOnPodsReady(tc.Task, tc.Job)
+			if ready != tc.ExpectedReady {
+				t.Errorf("Case %d (%s): expected ready: %v, got: %v", i, tc.Name, tc.ExpectedReady, ready)
 			}
 		})
 	}

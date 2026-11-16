@@ -17,19 +17,17 @@ limitations under the License.
 package vgpu
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8stypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
+	"volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/api/devices"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/config"
 )
@@ -132,11 +130,23 @@ func decodeContainerDevices(str string) ContainerDevices {
 	for _, val := range cd {
 		if strings.Contains(val, ",") {
 			tmpstr := strings.Split(val, ",")
+			if len(tmpstr) < 4 {
+				klog.Errorf("invalid container device %q: expected at least 4 fields", val)
+				continue
+			}
+			devmem, err := strconv.ParseUint(tmpstr[2], 10, 32)
+			if err != nil {
+				klog.Errorf("invalid used memory %q in container device %q: %v", tmpstr[2], val, err)
+				continue
+			}
+			devcores, err := strconv.ParseUint(tmpstr[3], 10, 32)
+			if err != nil {
+				klog.Errorf("invalid used cores %q in container device %q: %v", tmpstr[3], val, err)
+				continue
+			}
 			tmpdev.UUID = tmpstr[0]
 			tmpdev.Type = tmpstr[1]
-			devmem, _ := strconv.ParseInt(tmpstr[2], 10, 32)
 			tmpdev.Usedmem = uint(devmem)
-			devcores, _ := strconv.ParseInt(tmpstr[3], 10, 32)
 			tmpdev.Usedcores = uint(devcores)
 			contdev = append(contdev, tmpdev)
 		}
@@ -144,7 +154,8 @@ func decodeContainerDevices(str string) ContainerDevices {
 	return contdev
 }
 
-func decodePodDevices(str string) []ContainerDevices {
+// DecodePodDevices parses the vgpu-ids-new annotation into per-container device lists.
+func DecodePodDevices(str string) []ContainerDevices {
 	if len(str) == 0 {
 		return []ContainerDevices{}
 	}
@@ -154,6 +165,42 @@ func decodePodDevices(str string) []ContainerDevices {
 		pd = append(pd, cd)
 	}
 	return pd
+}
+
+// getPodGroupKey returns a unique key for the pod's group (namespace/name of PodGroup),
+// or "" if the pod has no group annotation. Used to avoid placing two pods from the same
+// PodGroup on the same vGPU device. Uses the same annotation keys as the job/podgroup
+// controllers (KubeGroupNameAnnotationKey and VolcanoGroupNameAnnotationKey).
+func getPodGroupKey(pod *v1.Pod) string {
+	if pod == nil || pod.Annotations == nil {
+		return ""
+	}
+	groupName := pod.Annotations[v1beta1.KubeGroupNameAnnotationKey]
+	if groupName == "" {
+		groupName = pod.Annotations[v1beta1.VolcanoGroupNameAnnotationKey]
+	}
+	if groupName == "" {
+		return ""
+	}
+	return pod.Namespace + "/" + groupName
+}
+
+// deviceHasPodFromSameGroup returns true if the device already has a pod from the same
+// PodGroup as currentKey (and that pod has non-zero usage), so we should not place
+// another pod from the same group on this device.
+func deviceHasPodFromSameGroup(gd *GPUDevice, currentKey string) bool {
+	if gd == nil || currentKey == "" {
+		return false
+	}
+	for _, usage := range gd.PodMap {
+		if usage == nil {
+			continue
+		}
+		if usage.PodGroupKey == currentKey && (usage.UsedMem > 0 || usage.UsedCore > 0) {
+			return true
+		}
+	}
+	return false
 }
 
 func checkVGPUResourcesInPod(pod *v1.Pod) bool {
@@ -170,73 +217,12 @@ func checkVGPUResourcesInPod(pod *v1.Pod) bool {
 	return false
 }
 
-func resourcereqs(pod *v1.Pod) []ContainerDeviceRequest {
-	resourceName := v1.ResourceName(getConfig().ResourceCountName)
-	resourceMem := v1.ResourceName(getConfig().ResourceMemoryName)
-	resourceMemPercentage := v1.ResourceName(getConfig().ResourceMemoryPercentageName)
-	resourceCores := v1.ResourceName(getConfig().ResourceCoreName)
-	counts := []ContainerDeviceRequest{}
-
-	//Count Nvidia GPU
-	for i := 0; i < len(pod.Spec.Containers); i++ {
-		singledevice := false
-		v, ok := pod.Spec.Containers[i].Resources.Limits[resourceName]
-		if !ok {
-			v, ok = pod.Spec.Containers[i].Resources.Limits[resourceMem]
-			singledevice = true
-		}
-		if ok {
-			n := int64(1)
-			if !singledevice {
-				n, _ = v.AsInt64()
-			}
-			memnum := uint(0)
-			mem, ok := pod.Spec.Containers[i].Resources.Limits[resourceMem]
-			if !ok {
-				mem, ok = pod.Spec.Containers[i].Resources.Requests[resourceMem]
-			}
-			if ok {
-				memnums, ok := mem.AsInt64()
-				if ok {
-					memnum = uint(memnums)
-				}
-			}
-			mempnum := int32(101)
-			mem, ok = pod.Spec.Containers[i].Resources.Limits[resourceMemPercentage]
-			if !ok {
-				mem, ok = pod.Spec.Containers[i].Resources.Requests[resourceMemPercentage]
-			}
-			if ok {
-				mempnums, ok := mem.AsInt64()
-				if ok {
-					mempnum = int32(mempnums)
-				}
-			}
-			if mempnum == 101 && memnum == 0 {
-				mempnum = 100
-			}
-			corenum := uint(0)
-			core, ok := pod.Spec.Containers[i].Resources.Limits[resourceCores]
-			if !ok {
-				core, ok = pod.Spec.Containers[i].Resources.Requests[resourceCores]
-			}
-			if ok {
-				corenums, ok := core.AsInt64()
-				if ok {
-					corenum = uint(corenums)
-				}
-			}
-			counts = append(counts, ContainerDeviceRequest{
-				Nums:             int32(n),
-				Type:             "NVIDIA",
-				Memreq:           memnum,
-				MemPercentagereq: int32(mempnum),
-				Coresreq:         corenum,
-			})
-		}
-	}
-	klog.V(3).Infoln("counts=", counts)
-	return counts
+func resourcereqs(pod *v1.Pod) []devices.ContainerDeviceRequest {
+	countName := getConfig().ResourceCountName
+	memoryName := getConfig().ResourceMemoryName
+	percentageName := getConfig().ResourceMemoryPercentageName
+	coreName := getConfig().ResourceCoreName
+	return devices.ExtractResourceRequest(pod, "NVIDIA", countName, memoryName, percentageName, coreName)
 }
 
 func checkGPUtype(annos map[string]string, cardtype string) bool {
@@ -273,7 +259,43 @@ func checkGPUtype(annos map[string]string, cardtype string) bool {
 	return true
 }
 
-func checkType(annos map[string]string, d GPUDevice, n ContainerDeviceRequest) bool {
+type gpuUUIDFilter struct {
+	allowlist []string
+	denylist  []string
+}
+
+func newGPUUUIDFilter(annos map[string]string) gpuUUIDFilter {
+	return gpuUUIDFilter{
+		allowlist: parseGPUUUIDList(annos[VGPUUseUUIDAnnotation]),
+		denylist:  parseGPUUUIDList(annos[VGPUNoUseUUIDAnnotation]),
+	}
+}
+
+func parseGPUUUIDList(value string) []string {
+	var uuids []string
+	for _, uuid := range strings.Split(value, ",") {
+		if uuid = strings.TrimSpace(uuid); uuid != "" {
+			uuids = append(uuids, uuid)
+		}
+	}
+	return uuids
+}
+
+func (f gpuUUIDFilter) enabled() bool {
+	return len(f.allowlist) > 0 || len(f.denylist) > 0
+}
+
+func (f gpuUUIDFilter) matches(id string) bool {
+	if id == "" && f.enabled() {
+		return false
+	}
+	if len(f.allowlist) > 0 && !slices.Contains(f.allowlist, id) {
+		return false
+	}
+	return !slices.Contains(f.denylist, id)
+}
+
+func checkType(annos map[string]string, d GPUDevice, n devices.ContainerDeviceRequest) bool {
 	//General type check, NVIDIA->NVIDIA MLU->MLU
 	if !strings.Contains(d.Type, n.Type) {
 		return false
@@ -295,11 +317,18 @@ func getGPUDeviceSnapShot(snap *GPUDevices) *GPUDevices {
 	}
 	for index, val := range snap.Device {
 		if val != nil {
+			podMapCopy := make(map[string]*GPUUsage, len(val.PodMap))
+			for uid, usage := range val.PodMap {
+				if usage != nil {
+					u := *usage
+					podMapCopy[uid] = &u
+				}
+			}
 			ret.Device[index] = &GPUDevice{
 				ID:          val.ID,
 				Node:        val.Node,
 				UUID:        val.UUID,
-				PodMap:      val.PodMap,
+				PodMap:      podMapCopy,
 				Memory:      val.Memory,
 				Number:      val.Number,
 				Type:        val.Type,
@@ -372,18 +401,60 @@ func checkNodeGPUSharingPredicateAndScore(pod *v1.Pod, gssnap *GPUDevices, repli
 	} else {
 		gs = gssnap
 	}
+	var currentPodGroupKey string
+	if pod.Annotations[VGPUPodGroupPolicyAnnotation] == VGPUPodGroupPolicySpreadValue {
+		currentPodGroupKey = getPodGroupKey(pod)
+	}
+
+	type tentativeAlloc struct {
+		device *GPUDevice
+		mem    uint
+		core   uint
+	}
+	rollbackTentative := func(allocs []tentativeAlloc) {
+		for _, alloc := range allocs {
+			if alloc.device == nil {
+				continue
+			}
+			if alloc.device.UsedNum > 0 {
+				alloc.device.UsedNum--
+			}
+			if alloc.device.UsedMem >= alloc.mem {
+				alloc.device.UsedMem -= alloc.mem
+			} else {
+				alloc.device.UsedMem = 0
+			}
+			if alloc.device.UsedCore >= alloc.core {
+				alloc.device.UsedCore -= alloc.core
+			} else {
+				alloc.device.UsedCore = 0
+			}
+		}
+	}
+
+	tentativeAllocs := []tentativeAlloc{}
 	ctrdevs := []ContainerDevices{}
+	uuidFilter := newGPUUUIDFilter(pod.Annotations)
 	for _, val := range ctrReq {
 		devs := []ContainerDevice{}
+		uuidMatched := false
 		if int(val.Nums) > len(gs.Device) {
+			rollbackTentative(tentativeAllocs)
 			return false, []ContainerDevices{}, 0, fmt.Errorf("no enough gpu cards on node %s", gs.Name)
 		}
 		klog.V(3).InfoS("Allocating device for container", "request", val)
 
-		for i := len(gs.Device) - 1; i >= 0; i-- {
+		for _, i := range sortedDeviceIndicesByPolicy(gs, schedulePolicy) {
 			klog.V(3).InfoS("Scoring pod request", "memReq", val.Memreq, "memPercentageReq", val.MemPercentagereq, "coresReq", val.Coresreq, "Nums", val.Nums, "Index", i, "ID", gs.Device[i].ID)
-			klog.V(3).InfoS("Current Device", "Index", i, "TotalMemory", gs.Device[i].Memory, "UsedMemory", gs.Device[i].UsedMem, "UsedCores", gs.Device[i].UsedCore, "replicate", replicate)
+			klog.V(3).InfoS("Current Device", "Index", i, "TotalMemory", gs.Device[i].Memory, "UsedMemory", gs.Device[i].UsedMem, "UsedCores", gs.Device[i].UsedCore, "UsedNum", gs.Device[i].UsedNum, "Number", gs.Device[i].Number, "replicate", replicate)
+			if !uuidFilter.matches(gs.Device[i].UUID) {
+				continue
+			}
+			uuidMatched = true
 			if gs.Device[i].Number <= uint(gs.Device[i].UsedNum) {
+				continue
+			}
+			if currentPodGroupKey != "" && deviceHasPodFromSameGroup(gs.Device[i], currentPodGroupKey) {
 				continue
 			}
 			memreqForCard := uint(0)
@@ -391,12 +462,12 @@ func checkNodeGPUSharingPredicateAndScore(pod *v1.Pod, gssnap *GPUDevices, repli
 			if val.MemPercentagereq != 101 {
 				memreqForCard = uint(float64(gs.Device[i].Memory) * float64(val.MemPercentagereq) / 100.0)
 			} else {
-				memreqForCard = val.Memreq
+				memreqForCard = uint(val.Memreq)
 			}
 			if int(gs.Device[i].Memory)-int(gs.Device[i].UsedMem) < int(memreqForCard) {
 				continue
 			}
-			if gs.Device[i].UsedCore+val.Coresreq > 100 {
+			if gs.Device[i].UsedCore+uint(val.Coresreq) > 100 {
 				continue
 			}
 			// Coresreq=100 indicates it want this card exclusively
@@ -416,6 +487,11 @@ func checkNodeGPUSharingPredicateAndScore(pod *v1.Pod, gssnap *GPUDevices, repli
 				klog.V(3).Info(gs.Device[i].ID, "not fit")
 				continue
 			}
+			tentativeAllocs = append(tentativeAllocs, tentativeAlloc{
+				device: gs.Device[i],
+				mem:    memreqForCard,
+				core:   uint(val.Coresreq),
+			})
 			//total += gs.Devices[i].Count
 			//free += node.Devices[i].Count - node.Devices[i].Used
 			if val.Nums > 0 {
@@ -425,7 +501,7 @@ func checkNodeGPUSharingPredicateAndScore(pod *v1.Pod, gssnap *GPUDevices, repli
 					UUID:      uuid,
 					Type:      val.Type,
 					Usedmem:   memreqForCard,
-					Usedcores: val.Coresreq,
+					Usedcores: uint(val.Coresreq),
 				})
 				score += GPUScore(schedulePolicy, gs.Device[i])
 			}
@@ -434,11 +510,54 @@ func checkNodeGPUSharingPredicateAndScore(pod *v1.Pod, gssnap *GPUDevices, repli
 			}
 		}
 		if val.Nums > 0 {
+			rollbackTentative(tentativeAllocs)
+			if uuidFilter.enabled() && !uuidMatched {
+				return false, []ContainerDevices{}, 0, fmt.Errorf(
+					"no GPU matches UUID constraints %s=%q, %s=%q on node %s",
+					VGPUUseUUIDAnnotation, pod.Annotations[VGPUUseUUIDAnnotation],
+					VGPUNoUseUUIDAnnotation, pod.Annotations[VGPUNoUseUUIDAnnotation],
+					gs.Name,
+				)
+			}
 			return false, []ContainerDevices{}, 0, fmt.Errorf("not enough gpu fitted on this node")
 		}
 		ctrdevs = append(ctrdevs, devs)
 	}
 	return true, ctrdevs, score, nil
+}
+
+func sortedDeviceIndicesByPolicy(gs *GPUDevices, schedulePolicy string) []int {
+	n := len(gs.Device)
+	idx := make([]int, 0, n)
+	switch schedulePolicy {
+	case binpackPolicy:
+		for i := range gs.Device {
+			idx = append(idx, i)
+		}
+		sort.Slice(idx, func(a, b int) bool {
+			da, db := gs.Device[idx[a]], gs.Device[idx[b]]
+			if da.UsedMem != db.UsedMem {
+				return da.UsedMem > db.UsedMem
+			}
+			return idx[a] < idx[b]
+		})
+	case spreadPolicy:
+		for i := range gs.Device {
+			idx = append(idx, i)
+		}
+		sort.Slice(idx, func(a, b int) bool {
+			da, db := gs.Device[idx[a]], gs.Device[idx[b]]
+			if da.UsedNum != db.UsedNum {
+				return da.UsedNum < db.UsedNum
+			}
+			return idx[a] < idx[b]
+		})
+	default:
+		for i := n - 1; i >= 0; i-- {
+			idx = append(idx, i)
+		}
+	}
+	return idx
 }
 
 func GPUScore(schedulePolicy string, device *GPUDevice) float64 {
@@ -447,62 +566,13 @@ func GPUScore(schedulePolicy string, device *GPUDevice) float64 {
 	case binpackPolicy:
 		score = binpackMultiplier * (float64(device.UsedMem) / float64(device.Memory))
 	case spreadPolicy:
-		if device.UsedNum == 1 {
+		if device.UsedNum == 0 {
 			score = spreadMultiplier
 		}
 	default:
 		score = float64(0)
 	}
 	return score
-}
-
-func patchPodAnnotations(kubeClient kubernetes.Interface, pod *v1.Pod, annotations map[string]string) error {
-	type patchMetadata struct {
-		Annotations map[string]string `json:"annotations,omitempty"`
-	}
-	type patchPod struct {
-		Metadata patchMetadata `json:"metadata"`
-		//Spec     patchSpec     `json:"spec,omitempty"`
-	}
-
-	p := patchPod{}
-	p.Metadata.Annotations = annotations
-
-	bytes, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	_, err = kubeClient.CoreV1().Pods(pod.Namespace).
-		Patch(context.Background(), pod.Name, k8stypes.StrategicMergePatchType, bytes, metav1.PatchOptions{})
-	if err != nil {
-		klog.Errorf("patch pod %v failed, %v", pod.Name, err)
-	}
-
-	return err
-}
-
-func patchNodeAnnotations(node *v1.Node, annotations map[string]string) error {
-	type patchMetadata struct {
-		Annotations map[string]string `json:"annotations,omitempty"`
-	}
-	type patchNode struct {
-		Metadata patchMetadata `json:"metadata"`
-		//Spec     patchSpec     `json:"spec,omitempty"`
-	}
-
-	p := patchNode{}
-	p.Metadata.Annotations = annotations
-
-	bytes, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	_, err = devices.GetClient().CoreV1().Nodes().
-		Patch(context.Background(), node.Name, k8stypes.StrategicMergePatchType, bytes, metav1.PatchOptions{})
-	if err != nil {
-		klog.Errorf("patch node %v failed, %v", node.Name, err)
-	}
-	return err
 }
 
 func getConfig() config.NvidiaConfig {

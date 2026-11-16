@@ -103,6 +103,53 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	})
 
+	// Test weight validation (enforced by CRD schema minimum: 1)
+	ginkgo.It("Should reject queue creation with negative weight", func() {
+		testCtx := util.InitTestContext(util.Options{})
+		defer util.CleanupTestContext(testCtx)
+
+		queue := &schedulingv1beta1.Queue{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-queue-weight-negative",
+			},
+			Spec: schedulingv1beta1.QueueSpec{
+				Weight: -1,
+			},
+		}
+
+		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
+		// Note: weight validation is now enforced by CRD schema (minimum: 1)
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("spec.weight"))
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("should be greater than or equal to 1"))
+	})
+
+	ginkgo.It("Should allow queue creation without weight specified (uses default)", func() {
+		testCtx := util.InitTestContext(util.Options{})
+		defer util.CleanupTestContext(testCtx)
+
+		queue := &schedulingv1beta1.Queue{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-queue-weight-default",
+			},
+			Spec: schedulingv1beta1.QueueSpec{
+				// Weight not specified, should use default: 1
+			},
+		}
+
+		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		// Verify that default weight was applied
+		createdQueue, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Get(context.TODO(), queue.Name, metav1.GetOptions{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(createdQueue.Spec.Weight).To(gomega.Equal(int32(1)))
+
+		// Cleanup
+		err = testCtx.Vcclient.SchedulingV1beta1().Queues().Delete(context.TODO(), queue.Name, metav1.DeleteOptions{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	})
+
 	// Test resource validation
 	ginkgo.It("Should allow queue creation with only deserved resource", func() {
 		testCtx := util.InitTestContext(util.Options{})
@@ -129,7 +176,7 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	})
 
-	ginkgo.It("Should allow queue creation with only guarantee resource", func() {
+	ginkgo.It("Should reject queue creation with only guarantee resource (deserved required)", func() {
 		testCtx := util.InitTestContext(util.Options{})
 		defer util.CleanupTestContext(testCtx)
 
@@ -149,11 +196,8 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 		}
 
 		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-
-		// Cleanup
-		err = testCtx.Vcclient.SchedulingV1beta1().Queues().Delete(context.TODO(), queue.Name, metav1.DeleteOptions{})
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(err).To(gomega.HaveOccurred())
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("must be >= guarantee"))
 	})
 
 	ginkgo.It("Should reject queue creation with capability less than deserved", func() {
@@ -179,7 +223,7 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 
 		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
 		gomega.Expect(err).To(gomega.HaveOccurred())
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring("deserved should less equal than capability"))
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("must be <= capability"))
 	})
 
 	ginkgo.It("Should reject queue creation with capability less than guarantee", func() {
@@ -207,7 +251,7 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 
 		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
 		gomega.Expect(err).To(gomega.HaveOccurred())
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring("guarantee should less equal than capability"))
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("must be >= guarantee"))
 	})
 
 	ginkgo.It("Should reject queue creation with deserved less than guarantee", func() {
@@ -235,11 +279,11 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 
 		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
 		gomega.Expect(err).To(gomega.HaveOccurred())
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring("guarantee should less equal than deserved"))
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("must be >= guarantee"))
 	})
 
-	// Test resource type validation - resources in deserved/guarantee must exist in capability
-	ginkgo.It("Should reject queue creation with deserved resource type not in capability", func() {
+	// Test resource type validation - resources in deserved/guarantee may include types not present in capability
+	ginkgo.It("Should allow queue creation with deserved resource type not in capability", func() {
 		testCtx := util.InitTestContext(util.Options{})
 		defer util.CleanupTestContext(testCtx)
 
@@ -260,11 +304,10 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 		}
 
 		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
-		gomega.Expect(err).To(gomega.HaveOccurred())
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring("deserved should less equal than capability"))
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	})
 
-	ginkgo.It("Should reject queue creation with guarantee resource type not in capability", func() {
+	ginkgo.It("Should allow queue creation with guarantee resource type not in capability", func() {
 		testCtx := util.InitTestContext(util.Options{})
 		defer util.CleanupTestContext(testCtx)
 
@@ -277,6 +320,10 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 				Capability: v1.ResourceList{
 					v1.ResourceCPU: resource.MustParse("10"),
 				},
+				Deserved: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("5"),
+					v1.ResourceMemory: resource.MustParse("8Gi"),
+				},
 				Guarantee: schedulingv1beta1.Guarantee{
 					Resource: v1.ResourceList{
 						v1.ResourceCPU:    resource.MustParse("5"),
@@ -287,8 +334,7 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 		}
 
 		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
-		gomega.Expect(err).To(gomega.HaveOccurred())
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring("guarantee should less equal than capability"))
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	})
 
 	ginkgo.It("Should reject queue creation with guarantee resource type not in deserved", func() {
@@ -315,7 +361,7 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 
 		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
 		gomega.Expect(err).To(gomega.HaveOccurred())
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring("guarantee should less equal than deserved"))
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("must be >= guarantee"))
 	})
 
 	// Test hierarchical queue annotations
@@ -471,6 +517,54 @@ var _ = ginkgo.Describe("Queue Validating E2E Test", func() {
 		}
 
 		gomega.Expect(updateErr).NotTo(gomega.HaveOccurred())
+
+		// Cleanup
+		err = testCtx.Vcclient.SchedulingV1beta1().Queues().Delete(context.TODO(), queueName, metav1.DeleteOptions{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	})
+
+	ginkgo.It("Should reject queue update with negative weight", func() {
+		queueName := "test-queue-update-weight-negative"
+		testCtx := util.InitTestContext(util.Options{})
+		defer util.CleanupTestContext(testCtx)
+
+		// Create queue with valid weight
+		queue := &schedulingv1beta1.Queue{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: queueName,
+			},
+			Spec: schedulingv1beta1.QueueSpec{
+				Weight: 1,
+			},
+		}
+
+		_, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		// Retry update with fresh object on conflict, but expect validation error
+		var updateErr error
+		for retryCount := 0; retryCount < 5; retryCount++ {
+			// Fetch the latest version before updating
+			latestQueue, err := testCtx.Vcclient.SchedulingV1beta1().Queues().Get(context.TODO(), queueName, metav1.GetOptions{})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			// Update with negative weight
+			latestQueue.Spec.Weight = -1
+
+			_, updateErr = testCtx.Vcclient.SchedulingV1beta1().Queues().Update(context.TODO(), latestQueue, metav1.UpdateOptions{})
+			// If we get a conflict, retry with fresh object
+			if errors.IsConflict(updateErr) {
+				continue
+			}
+			// For any other error (including validation errors), break and check
+			break
+		}
+
+		// We expect an error containing our validation message
+		gomega.Expect(updateErr).To(gomega.HaveOccurred())
+		// Note: weight validation is now enforced by CRD schema (minimum: 1)
+		gomega.Expect(updateErr.Error()).To(gomega.ContainSubstring("spec.weight"))
+		gomega.Expect(updateErr.Error()).To(gomega.ContainSubstring("should be greater than or equal to 1"))
 
 		// Cleanup
 		err = testCtx.Vcclient.SchedulingV1beta1().Queues().Delete(context.TODO(), queueName, metav1.DeleteOptions{})

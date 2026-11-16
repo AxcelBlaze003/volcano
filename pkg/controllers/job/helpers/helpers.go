@@ -24,6 +24,8 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 
 	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/volcano/pkg/controllers/apis"
@@ -35,6 +37,9 @@ const (
 	PodNameFmt = "%s-%s-%d"
 	// persistentVolumeClaimFmt represents persistent volume claim name format
 	persistentVolumeClaimFmt = "%s-pvc-%s"
+	// OutOfSyncKey is the pod annotation indicates that the pod should be restarted.
+	// And vcjob events (e.g. PodFailed, PodEvicted) of the pod with the annotation will be ignored.
+	OutOfSyncKey = "volcano.sh/controller-out-of-sync"
 )
 
 // GetPodIndexUnderTask returns task Index.
@@ -123,6 +128,53 @@ func GetJobKeyByReq(req *apis.Request) string {
 	return fmt.Sprintf("%s/%s", req.Namespace, req.JobName)
 }
 
+// SplitTaskNames splits a comma separated task name list into a slice,
+// keeping the original order and dropping empty entries.
+func SplitTaskNames(value string) []string {
+	names := strings.Split(value, ",")
+	res := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			res = append(res, name)
+		}
+	}
+	return res
+}
+
+// ResolveWorkerNames resolves the effective worker task name list from the
+// single-name "worker" flag and the comma separated "workers" flag: when
+// "workers" is set it takes precedence over "worker", and an empty result
+// means the caller should fall back to its default worker task name.
+// Duplicate names are dropped keeping the first occurrence, so rank offsets
+// and host lists never count a task twice.
+func ResolveWorkerNames(worker, workers string) []string {
+	var names []string
+	switch {
+	case workers != "":
+		if worker != "" {
+			klog.Warningf("both worker and workers flags are set, workers takes precedence: %s", workers)
+		}
+		names = SplitTaskNames(workers)
+	case worker != "":
+		names = SplitTaskNames(worker)
+	default:
+		return nil
+	}
+
+	res := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, duplicated := seen[name]; duplicated {
+			klog.Warningf("duplicated worker task name %s is ignored", name)
+			continue
+		}
+		seen[name] = struct{}{}
+		res = append(res, name)
+	}
+	return res
+}
+
 // GetTaskIndexUnderJob return index of the task in the job.
 func GetTaskIndexUnderJob(taskName string, job *batch.Job) int {
 	for index, task := range job.Spec.Tasks {
@@ -170,4 +222,27 @@ func GetTaskReplicasUnderJob(taskName string, job *batch.Job) int32 {
 		}
 	}
 	return 0
+}
+
+// IsOutOfSyncPod checks whether the pod is marked as out-of-sync.
+func IsOutOfSyncPod(pod *v1.Pod) bool {
+	if pod.Annotations == nil {
+		return false
+	}
+	_, exists := pod.Annotations[OutOfSyncKey]
+	return exists
+}
+
+// OutOfSyncJSONPatch generates a JSON patch to mark the pod as out-of-sync with the given reason.
+func OutOfSyncJSONPatch(uid types.UID) []byte {
+	return []byte(fmt.Sprintf(`[{"op":"test","path":"/metadata/uid","value":%q},{"op":"add","path":"/metadata/annotations/%s","value":"true"}]`,
+		uid, escapeJSONPointer(OutOfSyncKey)))
+}
+
+// escapeJSONPointer escapes a string for use in a JSON Pointer.
+// See RFC 6901 for details: https://datatracker.ietf.org/doc/html/rfc6901
+func escapeJSONPointer(s string) string {
+	s = strings.ReplaceAll(s, "~", "~0")
+	s = strings.ReplaceAll(s, "/", "~1")
+	return s
 }

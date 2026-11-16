@@ -27,7 +27,6 @@ import (
 	"strings"
 
 	fwk "k8s.io/kube-scheduler/framework"
-	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // TaskStatus defines the status of a task/pod.
@@ -113,11 +112,6 @@ func (np NodePhase) String() string {
 	return "Unknown"
 }
 
-// validateStatusUpdate validates whether the status transfer is valid.
-func validateStatusUpdate(oldStatus, newStatus TaskStatus) error {
-	return nil
-}
-
 // LessFn is the func declaration used by sort or priority queue.
 type LessFn func(interface{}, interface{}) bool
 
@@ -130,8 +124,8 @@ type VictimCompareFn func(interface{}, interface{}, interface{}) int
 // ValidateFn is the func declaration used to check object's status.
 type ValidateFn func(interface{}) bool
 
-// ValidateWithCandidateFn behaves like ValidateFn but take the candidate task into consideration.
-type ValidateWithCandidateFn func(interface{}, interface{}) bool
+// ValidateWithCandidateFn behaves like ValidateFn but takes candidate tasks into consideration.
+type ValidateWithCandidateFn func(interface{}, []*TaskInfo) bool
 
 // ValidateResult is struct to which can used to determine the result
 type ValidateResult struct {
@@ -170,6 +164,26 @@ type Status struct {
 	Code   int
 	Reason string
 	Plugin string
+	// InsufficientResources is the structured counterpart to Reason for a
+	// resource-shortage Unschedulable/UnschedulableAndUnresolvable status: it
+	// lists the resource dimension names (e.g. "cpu", "memory", "pods", or a
+	// scalar resource name) that caused the failure. Any code path that fails
+	// a task due to resource capacity (built-in resource-fit checks, the
+	// predicates Pod-count check, etc.) must populate this field so that
+	// downstream consumers (e.g. hint-key derivation) never need to parse the
+	// human-readable Reason string.
+	InsufficientResources []string
+}
+
+// PrePredicateError reports an unschedulable PrePredicate result and the
+// plugin that produced it.
+type PrePredicateError struct {
+	Plugin string
+	Reason string
+}
+
+func (e *PrePredicateError) Error() string {
+	return e.Reason
 }
 
 // String represents status string
@@ -320,6 +334,12 @@ type JobEnqueuedFn func(interface{})
 // PredicateFn is the func declaration used to predicate node for task.
 type PredicateFn func(*TaskInfo, *NodeInfo) error
 
+// QueueNodeFilterFn narrows candidate nodes before per-task predicates are evaluated,
+// using queue-level constraints that remain valid throughout the session.
+// Implementations must preserve input order and must not add nodes or modify the input.
+// Callers must not modify the returned slice, which may be shared within a session.
+type QueueNodeFilterFn func(*QueueInfo, []*NodeInfo) []*NodeInfo
+
 // PrePredicateFn is the func declaration used to pre-predicate node for task.
 type PrePredicateFn func(*TaskInfo) error
 
@@ -329,11 +349,36 @@ type BestNodeFn func(*TaskInfo, map[float64][]*NodeInfo) *NodeInfo
 // EvictableFn is the func declaration used to evict tasks.
 type EvictableFn func(*TaskInfo, []*TaskInfo) ([]*TaskInfo, int)
 
+// EvictionKind distinguishes gang-aware eviction from legacy task-level eviction.
+type EvictionKind int
+
+const (
+	EvictionKindUnknown     EvictionKind = iota
+	EvictionKindGangPreempt              // gang-aware preemption (gangpreempt action)
+	EvictionKindGangReclaim              // gang-aware reclaim (gangreclaim action)
+	EvictionKindTaskPreempt              // legacy task-level preemption
+	EvictionKindTaskReclaim              // legacy task-level reclaim
+)
+
+// EvictionContext carries the full initiator context for unified victim filtering.
+type EvictionContext struct {
+	Kind EvictionKind
+	Job  *JobInfo
+	// Task is only populated for task-level eviction (EvictionKindTaskPreempt / EvictionKindTaskReclaim).
+	// For gang-aware eviction kinds it is nil; use Job instead.
+	Task      *TaskInfo
+	HyperNode string
+}
+
+// UnifiedEvictableFn is the victim-filter callback for gang-aware eviction.
+// Plugins use EvictionContext.Kind to branch between gang and legacy modes.
+type UnifiedEvictableFn func(ctx *EvictionContext, candidates []*TaskInfo) ([]*TaskInfo, int)
+
 // NodeOrderFn is the func declaration used to get priority score for a node for a particular task.
 type NodeOrderFn func(*TaskInfo, *NodeInfo) (float64, error)
 
 // HyperNodeOrderFn is the func declaration used to score hyperNodes for job.
-type HyperNodeOrderFn func(*JobInfo, map[string][]*NodeInfo) (map[string]float64, error)
+type HyperNodeOrderFn func(*SubJobInfo, map[string][]*NodeInfo) (map[string]float64, error)
 
 // BatchNodeOrderFn is the func declaration used to get priority score for ALL nodes for a particular task.
 type BatchNodeOrderFn func(*TaskInfo, []*NodeInfo) (map[string]float64, error)
@@ -342,16 +387,16 @@ type BatchNodeOrderFn func(*TaskInfo, []*NodeInfo) (map[string]float64, error)
 type NodeMapFn func(*TaskInfo, *NodeInfo) (float64, error)
 
 // NodeReduceFn is the func declaration used to reduce priority score for a node for a particular task.
-type NodeReduceFn func(*TaskInfo, k8sframework.NodeScoreList) error
+type NodeReduceFn func(*TaskInfo, fwk.NodeScoreList) error
 
 // NodeOrderMapFn is the func declaration used to get priority score of all plugins for a node for a particular task.
 type NodeOrderMapFn func(*TaskInfo, *NodeInfo) (map[string]float64, float64, error)
 
 // HyperNodeOrderMapFn is the func declaration used to get priority score of all plugins for a hyperNode for a particular job.
-type HyperNodeOrderMapFn func(*JobInfo, map[string][]*NodeInfo) (map[string]map[string]float64, error)
+type HyperNodeOrderMapFn func(*SubJobInfo, map[string][]*NodeInfo) (map[string]map[string]float64, error)
 
 // NodeOrderReduceFn is the func declaration used to reduce priority score of all nodes for a plugin for a particular task.
-type NodeOrderReduceFn func(*TaskInfo, map[string]k8sframework.NodeScoreList) (map[string]float64, error)
+type NodeOrderReduceFn func(*TaskInfo, map[string]fwk.NodeScoreList) (map[string]float64, error)
 
 // TargetJobFn is the func declaration used to select the target job satisfies some conditions
 type TargetJobFn func([]*JobInfo) *JobInfo
@@ -378,3 +423,36 @@ type SimulatePredicateFn func(ctx context.Context, state fwk.CycleState, task *T
 // Simulate the allocatable check for a node
 // Plugins implement this function to verify if the queue has enough resources to schedule the task while maintaining topology constraints
 type SimulateAllocatableFn func(ctx context.Context, state fwk.CycleState, queue *QueueInfo, task *TaskInfo) bool
+
+type SearchPurpose int
+
+const (
+	// PurposeAllocate indicates the caller is performing placement/allocation search.
+	PurposeAllocate SearchPurpose = iota
+	// PurposeEvict indicates the caller is performing eviction search.
+	PurposeEvict
+)
+
+// HyperNodeGradientResult describes a plugin's constraints within the input search root.
+// Its zero value rejects the search; an unconstrained result must be explicit.
+type HyperNodeGradientResult struct {
+	// Unconstrained means the plugin permits the entire input subtree. Gradients
+	// must be empty when this is true. Preferred policies are evaluated by scoring.
+	Unconstrained bool
+	// Gradients contains eligible HyperNodes when Unconstrained is false.
+	// Both nil and empty gradients mean no feasible candidates remain.
+	Gradients [][]*HyperNodeInfo
+}
+
+// HyperNodeGradientForJobFn returns the plugin's topology constraints for a Job.
+type HyperNodeGradientForJobFn func(job *JobInfo, hyperNode *HyperNodeInfo, purpose SearchPurpose) HyperNodeGradientResult
+
+// HyperNodeGradientForSubJobFn returns the plugin's topology constraints for a SubJob.
+type HyperNodeGradientForSubJobFn func(subJob *SubJobInfo, hyperNode *HyperNodeInfo, purpose SearchPurpose) HyperNodeGradientResult
+
+// HyperNodeCandidateFn is an optional allocation-only fast path for nomination
+// validation. It must return exactly the supplied candidates that would occur in
+// the plugin's full allocation gradient, or Unconstrained for a neutral result.
+// A nil subJob requests the Job-level constraint. It does not replace either
+// gradient callback; plugins without this fast path keep using full gradients.
+type HyperNodeCandidateFn func(job *JobInfo, subJob *SubJobInfo, root *HyperNodeInfo, candidates []*HyperNodeInfo) HyperNodeGradientResult

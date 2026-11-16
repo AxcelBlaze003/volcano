@@ -6,6 +6,7 @@ approvers:
   - zen-xu
   - qiankunli
   - archlitchi
+  - hajnalmt
 reviewers:
   - k82cn
   - animeshsingh
@@ -16,3 +17,7 @@ reviewers:
   - zen-xu
   - shinytang6
   - merryzhou
+  - archlitchi
+  - hajnalmt
+  - dafu-wu
+  - devzizu

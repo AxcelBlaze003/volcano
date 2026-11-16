@@ -21,6 +21,7 @@ reviewers:
   - archlitchi
   - JesseStutler
   - kingeasternsun
+  - hajnalmt
 approvers:
   - k82cn
   - kevin-wangzefeng
@@ -35,3 +36,5 @@ approvers:
   - hwdef
   - wangyang0616
   - JesseStutler
+  - archlitchi
+  - hajnalmt

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-BIN_DIR=_output/bin
-RELEASE_DIR=_output/release
+OUTPUT_DIR ?= _output
+BIN_DIR=${OUTPUT_DIR}/bin
+RELEASE_DIR=${OUTPUT_DIR}/release
+IMAGES_DIR=${OUTPUT_DIR}/images
 REPO_PATH=volcano.sh/volcano
 IMAGE_PREFIX=volcanosh
 CRD_OPTIONS ?= "crd:crdVersions=v1,generateEmbeddedObjectMeta=true"
@@ -23,6 +25,7 @@ MUSL_CC ?= "/usr/local/musl/bin/musl-gcc"
 SUPPORT_PLUGINS ?= "no"
 CRD_VERSION ?= v1
 BUILDX_OUTPUT_TYPE ?= "docker"
+FORCE_REBUILD ?= true
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -66,7 +69,7 @@ include Makefile.def
 
 .EXPORT_ALL_VARIABLES:
 
-all: vc-scheduler vc-controller-manager vc-webhook-manager vc-agent vcctl command-lines
+all: vc-scheduler vc-agent-scheduler vc-controller-manager vc-hypernode-controller-manager vc-webhook-manager vc-agent vcctl command-lines
 
 init:
 	mkdir -p ${BIN_DIR}
@@ -79,8 +82,18 @@ vc-scheduler: init
 		CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-scheduler ./cmd/scheduler;\
 	fi;
 
+vc-agent-scheduler: init
+	if [ ${SUPPORT_PLUGINS} = "yes" ];then\
+		CC=${MUSL_CC} CGO_ENABLED=1 go build -ldflags ${LD_FLAGS_CGO} -o ${BIN_DIR}/vc-agent-scheduler ./cmd/agent-scheduler;\
+	else\
+		CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-agent-scheduler ./cmd/agent-scheduler;\
+	fi;
+
 vc-controller-manager: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-controller-manager ./cmd/controller-manager
+
+vc-hypernode-controller-manager: init
+	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-hypernode-controller-manager ./cmd/hypernode-controller-manager
 
 vc-webhook-manager: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-webhook-manager ./cmd/webhook-manager
@@ -90,32 +103,96 @@ vc-agent: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/network-qos ./cmd/network-qos
 
 vcctl: init
-	CC=${CC} CGO_ENABLED=0 GOOS=${OS} go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vcctl ./cmd/cli
+	CC=${CC} CGO_ENABLED=0 GOOS=$(if $(filter file,$(origin GOOS)),$(OS),$(GOOS)) GOARCH=$(GOARCH) go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vcctl ./cmd/cli
 
-image_bins: vc-scheduler vc-controller-manager vc-webhook-manager vc-agent
+image_bins: vc-scheduler vc-agent-scheduler vc-controller-manager vc-hypernode-controller-manager vc-webhook-manager vc-agent
 
-images:
-	for name in controller-manager scheduler webhook-manager agent; do\
-		docker buildx build -t "${IMAGE_PREFIX}/vc-$$name:$(TAG)" . -f ./installer/dockerfile/$$name/Dockerfile --output=type=${BUILDX_OUTPUT_TYPE} --platform ${DOCKER_PLATFORMS} --build-arg APK_MIRROR=${APK_MIRROR} --build-arg OPEN_EULER_IMAGE_TAG=${OPEN_EULER_IMAGE_TAG}; \
-	done
+images: vc-scheduler-image vc-agent-scheduler-image vc-controller-manager-image vc-hypernode-controller-manager-image vc-webhook-manager-image vc-agent-image
+
+# Define a reusable build function for individual component images
+define build_component_image
+	@if [ "$(FORCE_REBUILD)" = "true" ] || [ "$(BUILDX_OUTPUT_TYPE)" = "registry" ] || ! docker image inspect "${IMAGE_PREFIX}/vc-$(1):$(TAG)" >/dev/null 2>&1; then \
+		echo "Building image ${IMAGE_PREFIX}/vc-$(1):$(TAG)..."; \
+		docker buildx build -t "${IMAGE_PREFIX}/vc-$(1):$(TAG)" . \
+			-f ./installer/dockerfile/$(1)/Dockerfile \
+			--output=type=${BUILDX_OUTPUT_TYPE} \
+			--platform ${DOCKER_PLATFORMS} \
+			--build-arg APK_MIRROR=${APK_MIRROR} \
+			--build-arg OPEN_EULER_IMAGE_TAG=${OPEN_EULER_IMAGE_TAG}; \
+	else \
+		echo "Image ${IMAGE_PREFIX}/vc-$(1):$(TAG) already exists, skipping (use FORCE_REBUILD=true to rebuild)"; \
+	fi
+endef
+
+vc-controller-manager-image:
+	$(call build_component_image,controller-manager)
+
+vc-hypernode-controller-manager-image:
+	$(call build_component_image,hypernode-controller-manager)
+
+vc-scheduler-image:
+	$(call build_component_image,scheduler)
+
+vc-agent-scheduler-image:
+	$(call build_component_image,agent-scheduler)
+
+vc-webhook-manager-image:
+	$(call build_component_image,webhook-manager)
 
 vc-agent-image:
-	docker buildx build -t "${IMAGE_PREFIX}/vc-agent:$(TAG)" . -f ./installer/dockerfile/agent/Dockerfile --output=type=${BUILDX_OUTPUT_TYPE} --platform ${DOCKER_PLATFORMS} --build-arg APK_MIRROR=${APK_MIRROR} --build-arg OPEN_EULER_IMAGE_TAG=${OPEN_EULER_IMAGE_TAG}
+	$(call build_component_image,agent)
+
+save-images:
+	@mkdir -p ${IMAGES_DIR}
+	@echo "Saving images with gzip compression..."
+	bash -o pipefail -c 'docker save ${IMAGE_PREFIX}/vc-controller-manager:$(TAG) | gzip > ${IMAGES_DIR}/vc-controller-manager-$(TAG).tar.gz'
+	bash -o pipefail -c 'docker save ${IMAGE_PREFIX}/vc-hypernode-controller-manager:$(TAG) | gzip > ${IMAGES_DIR}/vc-hypernode-controller-manager-$(TAG).tar.gz'
+	bash -o pipefail -c 'docker save ${IMAGE_PREFIX}/vc-scheduler:$(TAG) | gzip > ${IMAGES_DIR}/vc-scheduler-$(TAG).tar.gz'
+	bash -o pipefail -c 'docker save ${IMAGE_PREFIX}/vc-agent-scheduler:$(TAG) | gzip > ${IMAGES_DIR}/vc-agent-scheduler-$(TAG).tar.gz'
+	bash -o pipefail -c 'docker save ${IMAGE_PREFIX}/vc-webhook-manager:$(TAG) | gzip > ${IMAGES_DIR}/vc-webhook-manager-$(TAG).tar.gz'
+	bash -o pipefail -c 'docker save ${IMAGE_PREFIX}/vc-agent:$(TAG) | gzip > ${IMAGES_DIR}/vc-agent-$(TAG).tar.gz'
+	@echo "Images saved to ${IMAGES_DIR}"
+
+load-images:
+	@echo "Loading images from ${IMAGES_DIR}..."
+	@set -- ${IMAGES_DIR}/*.tar.gz; \
+	if [ ! -e "$$1" ]; then \
+		echo "No image archives (*.tar.gz) found in ${IMAGES_DIR}"; \
+		exit 1; \
+	fi; \
+	for image in "$$@"; do \
+		echo "Loading $$image..."; \
+		gunzip -c "$$image" | docker load; \
+	done
+	@echo "All images loaded successfully"
 
 generate-code:
 	./hack/update-gencode.sh
 
 # Generate manifests e.g. CRD, RBAC etc.
 manifests: controller-gen
-	go mod vendor
 	# volcano crd base
-	$(CONTROLLER_GEN) $(CRD_OPTIONS) paths="./vendor/volcano.sh/apis/pkg/apis/scheduling/v1beta1;./vendor/volcano.sh/apis/pkg/apis/batch/v1alpha1;./vendor/volcano.sh/apis/pkg/apis/bus/v1alpha1;./vendor/volcano.sh/apis/pkg/apis/nodeinfo/v1alpha1;./vendor/volcano.sh/apis/pkg/apis/topology/v1alpha1" output:crd:artifacts:config=config/crd/volcano/bases
+	$(CONTROLLER_GEN) $(CRD_OPTIONS) \
+		paths="./staging/src/volcano.sh/apis/pkg/apis/scheduling/v1beta1; \
+		./staging/src/volcano.sh/apis/pkg/apis/batch/v1alpha1; \
+		./staging/src/volcano.sh/apis/pkg/apis/bus/v1alpha1; \
+		./staging/src/volcano.sh/apis/pkg/apis/nodeinfo/v1alpha1; \
+		./staging/src/volcano.sh/apis/pkg/apis/topology/v1alpha1; \
+		./staging/src/volcano.sh/apis/pkg/apis/shard/v1alpha1; \
+		./staging/src/volcano.sh/apis/pkg/apis/config/v1alpha1" \
+		output:crd:artifacts:config=config/crd/volcano/bases
 	# generate volcano job crd yaml without description to avoid yaml size limit when using `kubectl apply`
-	$(CONTROLLER_GEN) $(CRD_OPTIONS_EXCLUDE_DESCRIPTION) paths="./vendor/volcano.sh/apis/pkg/apis/batch/v1alpha1" output:crd:artifacts:config=config/crd/volcano/bases
+	$(CONTROLLER_GEN) $(CRD_OPTIONS_EXCLUDE_DESCRIPTION) \
+		paths="./staging/src/volcano.sh/apis/pkg/apis/batch/v1alpha1" \
+		output:crd:artifacts:config=config/crd/volcano/bases
 	# jobflow crd base
-	$(CONTROLLER_GEN) $(CRD_OPTIONS) paths="./vendor/volcano.sh/apis/pkg/apis/flow/v1alpha1" output:crd:artifacts:config=config/crd/jobflow/bases
+	$(CONTROLLER_GEN) $(CRD_OPTIONS) \
+		paths="./staging/src/volcano.sh/apis/pkg/apis/flow/v1alpha1" \
+		output:crd:artifacts:config=config/crd/jobflow/bases
 	# generate volcano jobflow crd yaml without description to avoid yaml size limit when using `kubectl apply`
-	$(CONTROLLER_GEN) $(CRD_OPTIONS_EXCLUDE_DESCRIPTION) paths="./vendor/volcano.sh/apis/pkg/apis/flow/v1alpha1" output:crd:artifacts:config=config/crd/jobflow/bases
+	$(CONTROLLER_GEN) $(CRD_OPTIONS_EXCLUDE_DESCRIPTION) \
+		paths="./staging/src/volcano.sh/apis/pkg/apis/flow/v1alpha1" \
+		output:crd:artifacts:config=config/crd/jobflow/bases
 
 unit-test:
 	go clean -testcache
@@ -135,6 +212,12 @@ e2e-test-schedulingbase: images
 e2e-test-schedulingaction: images
 	E2E_TYPE=SCHEDULINGACTION ./hack/run-e2e-kind.sh
 
+e2e-test-schedulinggates: images
+	E2E_TYPE=SCHEDULINGGATES FEATURE_GATES="SchedulingGatesQueueAdmission=true" ./hack/run-e2e-kind.sh
+
+e2e-test-unschedulablejobcache: images
+	E2E_TYPE=UNSCHEDULABLEJOBCACHE FEATURE_GATES="UnschedulableJobCache=true" UNSCHEDULABLE_JOB_CACHE_DEBUG_METRICS=true ./hack/run-e2e-kind.sh
+
 e2e-test-jobp: images
 	E2E_TYPE=JOBP ./hack/run-e2e-kind.sh
 
@@ -151,7 +234,7 @@ e2e-test-cronjob: images
 	E2E_TYPE=CRONJOB ./hack/run-e2e-kind.sh
 
 e2e-test-dra: images
-	E2E_TYPE=DRA FEATURE_GATES="DynamicResourceAllocation=true" ./hack/run-e2e-kind.sh
+	E2E_TYPE=DRA FEATURE_GATES="DynamicResourceAllocation=true,DRAConsumableCapacity=true,DRAPrioritizedList=true" ./hack/run-e2e-kind.sh
 
 e2e-test-hypernode: images
 	E2E_TYPE=HYPERNODE ./hack/run-e2e-kind.sh
@@ -161,6 +244,21 @@ e2e-test-admission-webhook: images
 
 e2e-test-admission-policy: images
 	E2E_TYPE=ADMISSION_POLICY ./hack/run-e2e-kind.sh
+
+e2e-test-namespacequeue: images
+	E2E_TYPE=NAMESPACEQUEUE ./hack/run-e2e-kind.sh
+
+e2e-test-agentscheduler: images
+	E2E_TYPE=AGENTSCHEDULER$(if $(SHARDING_MODE),_$(shell echo $(SHARDING_MODE) | tr '[:lower:]' '[:upper:]'),) ./hack/run-e2e-kind.sh
+
+e2e-test-shardingcontroller: images
+	E2E_TYPE=SHARDINGCONTROLLER ./hack/run-e2e-kind.sh
+
+e2e-test-gangevict: images
+	E2E_TYPE=GANGEVICT ./hack/run-e2e-kind.sh
+
+e2e-test-schedulersharding: images
+	E2E_TYPE=SCHEDULERSHARDING$(if $(SHARDING_MODE),_$(shell echo $(SHARDING_MODE) | tr '[:lower:]' '[:upper:]'),) ./hack/run-e2e-kind.sh
 
 generate-yaml: init manifests
 	./hack/generate-yaml.sh CRD_VERSION=${CRD_VERSION}
@@ -210,7 +308,7 @@ ifeq (, $(shell which controller-gen))
 	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
 	cd $$CONTROLLER_GEN_TMP_DIR ;\
 	go mod init tmp ;\
-	GOOS=${OS} go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.18.0 ;\
+	GOOS=${OS} go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.0 ;\
 	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
 	}
 CONTROLLER_GEN=$(GOBIN)/controller-gen
@@ -221,16 +319,19 @@ endif
 update-development-yaml:
 	make generate-yaml RELEASE_DIR=installer
 	mv installer/volcano-${TAG}.yaml installer/volcano-development.yaml
+	mv installer/volcano-agent-scheduler-${TAG}.yaml installer/volcano-agent-scheduler-development.yaml
 	mv installer/volcano-agent-${TAG}.yaml installer/volcano-agent-development.yaml
 	mv installer/volcano-monitoring-${TAG}.yaml installer/volcano-monitoring.yaml
 
 	ENABLE_VAP=true make generate-yaml RELEASE_DIR=installer
 	mv installer/volcano-${TAG}.yaml installer/volcano-development-vap.yaml
+	rm installer/volcano-agent-scheduler-${TAG}.yaml
 	rm installer/volcano-agent-${TAG}.yaml
 	rm installer/volcano-monitoring-${TAG}.yaml
 
 	ENABLE_VAP=true ENABLE_MAP=true make generate-yaml RELEASE_DIR=installer
 	mv installer/volcano-${TAG}.yaml installer/volcano-development-vap-map.yaml
+	rm installer/volcano-agent-scheduler-${TAG}.yaml
 	rm installer/volcano-agent-${TAG}.yaml
 	rm installer/volcano-monitoring-${TAG}.yaml
 

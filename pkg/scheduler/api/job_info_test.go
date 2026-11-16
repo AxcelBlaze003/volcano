@@ -21,21 +21,109 @@ limitations under the License.
 package api
 
 import (
+	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
+
+	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/apis/pkg/apis/scheduling"
 	schedulingv2 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 )
 
-func jobInfoEqual(l, r *JobInfo) bool {
-	return equality.Semantic.DeepEqual(l, r)
+func TestNewTaskInfo(t *testing.T) {
+	tests := []struct {
+		name             string
+		requests         v1.ResourceList
+		claims           []v1.PodResourceClaim
+		wantBestEffort   bool
+		wantInitRequests bool
+	}{
+		{
+			name:           "no requests",
+			wantBestEffort: true,
+		},
+		{
+			name:           "zero CPU and memory",
+			requests:       BuildResourceList("0", "0"),
+			wantBestEffort: true,
+		},
+		{
+			name:             "CPU request",
+			requests:         BuildResourceList("1", "0"),
+			wantInitRequests: true,
+		},
+		{
+			name:             "extended resource request",
+			requests:         v1.ResourceList{"example.com/gpu": resource.MustParse("1")},
+			wantInitRequests: true,
+		},
+		{
+			name:             "DRA only with ResourceClaim",
+			claims:           []v1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptr.To("gpu-claim")}},
+			wantBestEffort:   false,
+			wantInitRequests: false,
+		},
+		{
+			name:             "DRA only with ResourceClaimTemplate",
+			claims:           []v1.PodResourceClaim{{Name: "gpu", ResourceClaimTemplateName: ptr.To("gpu-template")}},
+			wantBestEffort:   false,
+			wantInitRequests: false,
+		},
+		{
+			name:             "CPU and DRA",
+			requests:         BuildResourceList("1", "0"),
+			claims:           []v1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptr.To("gpu-claim")}},
+			wantInitRequests: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := buildPod("c1", "p1", "", v1.PodPending, tt.requests, nil, nil)
+			pod.Spec.ResourceClaims = tt.claims
+			for _, claim := range tt.claims {
+				pod.Spec.Containers[0].Resources.Claims = append(pod.Spec.Containers[0].Resources.Claims, v1.ResourceClaim{Name: claim.Name})
+			}
+			task := NewTaskInfo(pod)
+			assert.Equal(t, tt.wantBestEffort, task.BestEffort)
+			assert.Equal(t, !tt.wantBestEffort, task.HasSchedulingResourceRequests())
+			assert.Equal(t, tt.wantInitRequests, task.HasInitResourceRequests())
+		})
+	}
+}
+
+func TestHasSchedulingResourceRequests(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *Resource
+		want    bool
+	}{
+		{
+			name:    "nil Pod without ordinary requests",
+			request: EmptyResource(),
+			want:    false,
+		},
+		{
+			name:    "nil Pod with ordinary requests",
+			request: NewResource(BuildResourceList("1", "0")),
+			want:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &TaskInfo{
+				InitResreq: tt.request,
+			}
+			assert.Equal(t, tt.want, task.HasSchedulingResourceRequests())
+		})
+	}
 }
 
 func TestAddTaskInfo(t *testing.T) {
@@ -67,13 +155,13 @@ func TestAddTaskInfo(t *testing.T) {
 				UID:          case01UID,
 				Allocated:    buildResource("4000m", "4G", map[string]string{"pods": "3"}, 0),
 				TotalRequest: buildResource("5000m", "5G", map[string]string{"pods": "4"}, 0),
-				Tasks: tasksMap{
+				Tasks: TasksMap{
 					case01Task1.UID: case01Task1,
 					case01Task2.UID: case01Task2,
 					case01Task3.UID: case01Task3,
 					case01Task4.UID: case01Task4,
 				},
-				TaskStatusIndex: map[TaskStatus]tasksMap{
+				TaskStatusIndex: map[TaskStatus]TasksMap{
 					Running: {
 						case01Task2.UID: case01Task2,
 					},
@@ -85,6 +173,48 @@ func TestAddTaskInfo(t *testing.T) {
 						case01Task4.UID: case01Task4,
 					},
 				},
+				MinSubJobs: make(map[SubJobGID]int32),
+				SubJobs: map[SubJobID]*SubJobInfo{
+					SubJobID(case01UID): {
+						GID:          SubJobGID(case01UID),
+						UID:          SubJobID(case01UID),
+						Job:          case01UID,
+						MinAvailable: 0,
+						Priority:     1,
+						Tasks: TasksMap{
+							case01Task1.UID: case01Task1,
+							case01Task2.UID: case01Task2,
+							case01Task3.UID: case01Task3,
+							case01Task4.UID: case01Task4,
+						},
+						TaskStatusIndex: map[TaskStatus]TasksMap{
+							Running: {
+								case01Task2.UID: case01Task2,
+							},
+							Pending: {
+								case01Task1.UID: case01Task1,
+							},
+							Bound: {
+								case01Task3.UID: case01Task3,
+								case01Task4.UID: case01Task4,
+							},
+						},
+						taskPriorities: map[int32]sets.Set[TaskID]{
+							1: {
+								case01Task1.UID: sets.Empty{},
+								case01Task2.UID: sets.Empty{},
+								case01Task3.UID: sets.Empty{},
+								case01Task4.UID: sets.Empty{},
+							},
+						},
+					},
+				},
+				TaskToSubJob: map[TaskID]SubJobID{
+					case01Task1.UID: SubJobID(case01UID),
+					case01Task2.UID: SubJobID(case01UID),
+					case01Task3.UID: SubJobID(case01UID),
+					case01Task4.UID: SubJobID(case01UID),
+				},
 				NodesFitErrors:   make(map[TaskID]*FitErrors),
 				TaskMinAvailable: make(map[string]int32),
 				Budget:           &DisruptionBudget{},
@@ -92,18 +222,17 @@ func TestAddTaskInfo(t *testing.T) {
 		},
 	}
 
-	for i, test := range tests {
-		ps := NewJobInfo(test.uid)
-		ps.Budget = &DisruptionBudget{}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ps := NewJobInfo(test.uid)
+			ps.Budget = &DisruptionBudget{}
 
-		for _, pod := range test.pods {
-			pi := NewTaskInfo(pod)
-			ps.AddTaskInfo(pi)
-		}
-		if !jobInfoEqual(ps, test.expected) {
-			t.Errorf("podset info %d: \n expected: %v, \n got: %v \n",
-				i, test.expected, ps)
-		}
+			for _, pod := range test.pods {
+				pi := NewTaskInfo(pod)
+				ps.AddTaskInfo(pi)
+			}
+			assert.Equal(t, test.expected, ps)
+		})
 	}
 }
 
@@ -144,13 +273,41 @@ func TestDeleteTaskInfo(t *testing.T) {
 				Allocated:    buildResource("3000m", "3G", map[string]string{"pods": "1"}, 0),
 				TotalRequest: buildResource("4000m", "4G", map[string]string{"pods": "2"}, 0),
 				UID:          case01UID,
-				Tasks: tasksMap{
+				Tasks: TasksMap{
 					case01Task1.UID: case01Task1,
 					case01Task3.UID: case01Task3,
 				},
-				TaskStatusIndex: map[TaskStatus]tasksMap{
+				TaskStatusIndex: map[TaskStatus]TasksMap{
 					Pending: {case01Task1.UID: case01Task1},
 					Running: {case01Task3.UID: case01Task3},
+				},
+				MinSubJobs: make(map[SubJobGID]int32),
+				SubJobs: map[SubJobID]*SubJobInfo{
+					SubJobID(case01UID): {
+						GID:          SubJobGID(case01UID),
+						UID:          SubJobID(case01UID),
+						Job:          case01UID,
+						MinAvailable: 0,
+						Priority:     1,
+						Tasks: TasksMap{
+							case01Task1.UID: case01Task1,
+							case01Task3.UID: case01Task3,
+						},
+						TaskStatusIndex: map[TaskStatus]TasksMap{
+							Pending: {case01Task1.UID: case01Task1},
+							Running: {case01Task3.UID: case01Task3},
+						},
+						taskPriorities: map[int32]sets.Set[TaskID]{
+							1: {
+								case01Task1.UID: sets.Empty{},
+								case01Task3.UID: sets.Empty{},
+							},
+						},
+					},
+				},
+				TaskToSubJob: map[TaskID]SubJobID{
+					case01Task1.UID: SubJobID(case01UID),
+					case01Task3.UID: SubJobID(case01UID),
 				},
 				NodesFitErrors:   make(map[TaskID]*FitErrors),
 				TaskMinAvailable: make(map[string]int32),
@@ -166,17 +323,49 @@ func TestDeleteTaskInfo(t *testing.T) {
 				Allocated:    buildResource("3000m", "3G", map[string]string{"pods": "1"}, 0),
 				TotalRequest: buildResource("4000m", "4G", map[string]string{"pods": "2"}, 0),
 				UID:          case02UID,
-				Tasks: tasksMap{
+				Tasks: TasksMap{
 					case02Task1.UID: case02Task1,
 					case02Task3.UID: case02Task3,
 				},
-				TaskStatusIndex: map[TaskStatus]tasksMap{
+				TaskStatusIndex: map[TaskStatus]TasksMap{
 					Pending: {
 						case02Task1.UID: case02Task1,
 					},
 					Running: {
 						case02Task3.UID: case02Task3,
 					},
+				},
+				MinSubJobs: make(map[SubJobGID]int32),
+				SubJobs: map[SubJobID]*SubJobInfo{
+					SubJobID(case02UID): {
+						GID:          SubJobGID(case02UID),
+						UID:          SubJobID(case02UID),
+						Job:          case02UID,
+						MinAvailable: 0,
+						Priority:     1,
+						Tasks: TasksMap{
+							case02Task1.UID: case02Task1,
+							case02Task3.UID: case02Task3,
+						},
+						TaskStatusIndex: map[TaskStatus]TasksMap{
+							Pending: {
+								case02Task1.UID: case02Task1,
+							},
+							Running: {
+								case02Task3.UID: case02Task3,
+							},
+						},
+						taskPriorities: map[int32]sets.Set[TaskID]{
+							1: {
+								case02Task1.UID: sets.Empty{},
+								case02Task3.UID: sets.Empty{},
+							},
+						},
+					},
+				},
+				TaskToSubJob: map[TaskID]SubJobID{
+					case02Task1.UID: SubJobID(case02UID),
+					case02Task3.UID: SubJobID(case02UID),
 				},
 				NodesFitErrors:   make(map[TaskID]*FitErrors),
 				TaskMinAvailable: make(map[string]int32),
@@ -185,24 +374,160 @@ func TestDeleteTaskInfo(t *testing.T) {
 		},
 	}
 
-	for i, test := range tests {
-		ps := NewJobInfo(test.uid)
-		ps.Budget = &DisruptionBudget{}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ps := NewJobInfo(test.uid)
+			ps.Budget = &DisruptionBudget{}
 
-		for _, pod := range test.pods {
-			pi := NewTaskInfo(pod)
-			ps.AddTaskInfo(pi)
-		}
+			for _, pod := range test.pods {
+				pi := NewTaskInfo(pod)
+				ps.AddTaskInfo(pi)
+			}
 
-		for _, pod := range test.rmPods {
-			pi := NewTaskInfo(pod)
-			ps.DeleteTaskInfo(pi)
-		}
+			for _, pod := range test.rmPods {
+				pi := NewTaskInfo(pod)
+				ps.DeleteTaskInfo(pi)
+			}
 
-		if !jobInfoEqual(ps, test.expected) {
-			t.Errorf("podset info %d: \n expected: %v, \n got: %v \n",
-				i, test.expected, ps)
-		}
+			assert.Equal(t, test.expected, ps)
+		})
+	}
+}
+
+func TestJobInfoFitError(t *testing.T) {
+	const summary = "pod group is not ready, 2 minAvailable, 3 Pending; Pending: 3 Unschedulable"
+	tests := []struct {
+		name                 string
+		order                []TaskID
+		errors               map[TaskID]string
+		jobError             string
+		remove               TaskID
+		expectedBeforeDelete string
+		expected             string
+		recreate             TaskID
+		replacementUID       TaskID
+		updateTask           TaskID
+		update               string
+		expectedAfterUpdate  string
+	}{
+		{
+			name:     "multiple failures",
+			order:    []TaskID{"a", "b", "c"},
+			errors:   map[TaskID]string{"a": "Insufficient cpu", "b": "Insufficient memory", "c": "Node affinity mismatch"},
+			expected: summary + ". Node: task-a: Insufficient memory",
+		},
+		{
+			name:     "reversed insertion order",
+			order:    []TaskID{"c", "b", "a"},
+			errors:   map[TaskID]string{"a": "Insufficient cpu", "b": "Insufficient memory", "c": "Node affinity mismatch"},
+			expected: summary + ". Node: task-a: Insufficient memory",
+		},
+		{
+			name:     "nil failure is ignored",
+			order:    []TaskID{"a", "b", "c"},
+			errors:   map[TaskID]string{"a": "Insufficient cpu", "b": "", "c": "Node affinity mismatch"},
+			expected: summary + ". Node: task-b: Node affinity mismatch",
+		},
+		{
+			name:     "single failure",
+			order:    []TaskID{"a", "b", "c"},
+			errors:   map[TaskID]string{"c": "Node affinity mismatch"},
+			expected: summary + ". Node: task-b: Node affinity mismatch",
+		},
+		{
+			name:     "no failures",
+			order:    []TaskID{"a", "b", "c"},
+			expected: summary,
+		},
+		{
+			name:     "job and task failures",
+			order:    []TaskID{"a", "b", "c"},
+			errors:   map[TaskID]string{"a": "Insufficient cpu", "b": "Insufficient memory"},
+			jobError: "No eligible hypernode",
+			expected: summary + ". HyperNode: No eligible hypernode; Node: task-a: Insufficient memory",
+		},
+		{
+			name:     "job failure only",
+			order:    []TaskID{"a", "b", "c"},
+			jobError: "No eligible hypernode",
+			expected: summary + ". HyperNode: No eligible hypernode",
+		},
+		{
+			name:                "representative failure changes",
+			order:               []TaskID{"a", "b", "c"},
+			errors:              map[TaskID]string{"a": "Insufficient cpu", "b": "Insufficient memory"},
+			expected:            summary + ". Node: task-a: Insufficient memory",
+			updateTask:          "b",
+			update:              "Node affinity mismatch",
+			expectedAfterUpdate: summary + ". Node: task-a: Node affinity mismatch",
+		},
+		{
+			name:           "same-name task recreated with a higher UID",
+			order:          []TaskID{"a", "b", "c"},
+			errors:         map[TaskID]string{"b": "Insufficient memory", "c": "Node affinity mismatch"},
+			recreate:       "b",
+			replacementUID: "z",
+			expected:       summary + ". Node: task-a: Insufficient memory",
+		},
+		{
+			name:                 "representative task deleted",
+			order:                []TaskID{"a", "b", "c"},
+			errors:               map[TaskID]string{"a": "Insufficient cpu", "b": "Insufficient memory", "c": "Node affinity mismatch"},
+			remove:               "b",
+			expectedBeforeDelete: summary + ". Node: task-a: Insufficient memory",
+			expected:             "pod group is not ready, 2 Pending, 2 minAvailable; Pending: 2 Unschedulable. Node: task-b: Node affinity mismatch",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job := NewJobInfo("job")
+			names := map[TaskID]string{"a": "task-z", "b": "task-a", "c": "task-b"}
+			for _, uid := range tt.order {
+				pod := buildPod("ns", names[uid], "", v1.PodPending, BuildResourceList("1", "1Gi"), nil, nil)
+				pod.UID = types.UID(uid)
+				job.AddTaskInfo(NewTaskInfo(pod))
+			}
+			job.SetPodGroup(&PodGroup{PodGroup: scheduling.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pg"},
+				Spec:       scheduling.PodGroupSpec{MinMember: 2},
+			}})
+			job.JobFitErrors = tt.jobError
+			for uid, message := range tt.errors {
+				if message == "" {
+					job.NodesFitErrors[uid] = nil
+					continue
+				}
+				fe := NewFitErrors()
+				fe.SetError(message)
+				job.NodesFitErrors[uid] = fe
+			}
+			if tt.remove != "" {
+				assert.Equal(t, tt.expectedBeforeDelete, job.FitError())
+				job.DeleteTaskInfo(job.Tasks[tt.remove])
+			}
+			// Map iteration can start in a different order on every call. Sample
+			// it 32 times with this three-task fixture to catch unstable output
+			// at low cost, checking every result rather than retrying failures.
+			for i := 0; i < 32; i++ {
+				assert.Equal(t, tt.expected, job.FitError())
+			}
+			if tt.recreate != "" {
+				oldTask := job.Tasks[tt.recreate]
+				pod := oldTask.Pod.DeepCopy()
+				job.DeleteTaskInfo(oldTask)
+				pod.UID = types.UID(tt.replacementUID)
+				replacement := NewTaskInfo(pod)
+				job.AddTaskInfo(replacement)
+				fe := NewFitErrors()
+				fe.SetError(tt.errors[tt.recreate])
+				job.NodesFitErrors[replacement.UID] = fe
+				assert.Equal(t, tt.expected, job.FitError())
+			}
+			if tt.updateTask != "" {
+				job.NodesFitErrors[tt.updateTask].SetError(tt.update)
+				assert.Equal(t, tt.expectedAfterUpdate, job.FitError())
+			}
+		})
 	}
 }
 
@@ -214,16 +539,44 @@ func TestTaskSchedulingReason(t *testing.T) {
 	t5 := buildPod("ns1", "task-5", "node3", v1.PodPending, BuildResourceList("1", "1G"), nil, make(map[string]string))
 	t6 := buildPod("ns1", "task-6", "", v1.PodPending, BuildResourceList("1", "1G"), nil, make(map[string]string))
 
-	originReason1 := ". Origin reason is task-6: 0/3 nodes are unavailable: 1 node(s) pod number exceeded, 2 node(s) resource fit failed."
+	originReason1 := ". Node: task-6: 0/3 nodes are unavailable: 1 node(s) pod number exceeded, 2 node(s) resource fit failed."
 
+	type schedulingReason struct {
+		reason            string
+		message           string
+		nominatedNodeName string
+	}
 	tests := []struct {
-		desc     string
-		pods     []*v1.Pod
-		jobid    JobID
-		origin   string // origin reason string from first failed pod
-		nodefes  map[TaskID]*FitErrors
-		expected map[types.UID]string
+		desc             string
+		pods             []*v1.Pod
+		jobid            JobID
+		nodefes          map[TaskID]*FitErrors
+		expectedFitError string
+		expected         map[types.UID]schedulingReason
 	}{
+		{
+			desc:  "each failed task keeps its own node diagnostics",
+			pods:  []*v1.Pod{t1, t2, t6},
+			jobid: JobID("multiple-failures"),
+			nodefes: map[TaskID]*FitErrors{
+				TaskID(t1.UID): {
+					nodes: map[string]*FitError{
+						"node1": {Status: []*Status{{Reason: NodeResourceFitFailed}}},
+					},
+				},
+				TaskID(t2.UID): {
+					nodes: map[string]*FitError{
+						"node1": {Status: []*Status{{Reason: NodePodNumberExceeded}}},
+					},
+				},
+			},
+			expectedFitError: "pod group is not ready, 3 Pending, 3 minAvailable; Pending: 3 Unschedulable. Node: task-1: 0/1 nodes are unavailable: 1 node(s) resource fit failed.",
+			expected: map[types.UID]schedulingReason{
+				t1.UID: {reason: PodReasonUnschedulable, message: "Node: 0/1 nodes are unavailable: 1 node(s) resource fit failed."},
+				t2.UID: {reason: PodReasonUnschedulable, message: "Node: 0/1 nodes are unavailable: 1 node(s) pod number exceeded."},
+				t6.UID: {reason: PodReasonUnschedulable},
+			},
+		},
 		{
 			desc:  "task3 ~ 5 are schedulable",
 			pods:  []*v1.Pod{t1, t2, t3, t4, t5, t6},
@@ -237,19 +590,19 @@ func TestTaskSchedulingReason(t *testing.T) {
 					},
 				},
 			},
-			expected: map[types.UID]string{
-				"pg":   "pod group is not ready, 6 Pending, 6 minAvailable; Pending: 3 Schedulable, 3 Unschedulable" + originReason1,
-				t1.UID: "pod group is not ready, 6 Pending, 6 minAvailable; Pending: 3 Schedulable, 3 Unschedulable" + originReason1,
-				t2.UID: "pod group is not ready, 6 Pending, 6 minAvailable; Pending: 3 Schedulable, 3 Unschedulable" + originReason1,
-				t3.UID: "Pod ns1/task-3 can possibly be assigned to node1, once minAvailable is satisfied",
-				t4.UID: "Pod ns1/task-4 can possibly be assigned to node2, once minAvailable is satisfied",
-				t5.UID: "Pod ns1/task-5 can possibly be assigned to node3, once minAvailable is satisfied",
-				t6.UID: "0/3 nodes are unavailable: 1 node(s) pod number exceeded, 2 node(s) resource fit failed.",
+			expectedFitError: "pod group is not ready, 6 Pending, 6 minAvailable; Pending: 3 Schedulable, 3 Unschedulable" + originReason1,
+			expected: map[types.UID]schedulingReason{
+				t1.UID: {reason: PodReasonUnschedulable},
+				t2.UID: {reason: PodReasonUnschedulable},
+				t3.UID: {reason: PodReasonSchedulable, message: "Pod ns1/task-3 can possibly be assigned to node1, once minAvailable is satisfied"},
+				t4.UID: {reason: PodReasonSchedulable, message: "Pod ns1/task-4 can possibly be assigned to node2, once minAvailable is satisfied"},
+				t5.UID: {reason: PodReasonSchedulable, message: "Pod ns1/task-5 can possibly be assigned to node3, once minAvailable is satisfied"},
+				t6.UID: {reason: PodReasonUnschedulable, message: "Node: 0/3 nodes are unavailable: 1 node(s) pod number exceeded, 2 node(s) resource fit failed."},
 			},
 		},
 	}
 
-	for i, test := range tests {
+	for _, test := range tests {
 		job := NewJobInfo(test.jobid)
 		pg := scheduling.PodGroup{
 			ObjectMeta: metav1.ObjectMeta{
@@ -281,112 +634,241 @@ func TestTaskSchedulingReason(t *testing.T) {
 		// complete job
 		job.SetPodGroup(&PodGroup{PodGroup: pg})
 		job.NodesFitErrors = test.nodefes
-		job.TaskStatusIndex = map[TaskStatus]tasksMap{Pending: {}}
+		job.TaskStatusIndex = map[TaskStatus]TasksMap{Pending: {}}
 		for _, task := range job.Tasks {
 			task.Status = Pending
 			job.TaskStatusIndex[Pending][task.UID] = task
 		}
-		job.JobFitErrors = job.FitError()
-
-		// assert
-		for uid, exp := range test.expected {
-			msg := job.JobFitErrors
-			if uid != "pg" {
-				_, msg, _ = job.TaskSchedulingReason(TaskID(uid))
-			}
-			if msg != exp {
-				t.Errorf("[x] case #%d, task %v\nwant: %s\n got: %s", i, uid, exp, msg)
-			}
+		assert.Equal(t, test.expectedFitError, job.FitError(), test.desc)
+		for uid, expected := range test.expected {
+			reason, message, nominatedNodeName := job.TaskSchedulingReason(TaskID(uid))
+			assert.Equal(t, expected, schedulingReason{reason, message, nominatedNodeName}, "%s: task %s", test.desc, uid)
 		}
 	}
 }
 
-func TestJobInfo(t *testing.T) {
-	newTaskFunc := func(uid, jobUid types.UID, status TaskStatus, resources *Resource) *TaskInfo {
-		isBestEffort := resources.IsEmpty()
-		return &TaskInfo{
-			UID:  TaskID(uid),
-			Job:  JobID(jobUid),
-			Name: string(uid),
-			TransactionContext: TransactionContext{
-				Status: status,
-			},
-			Resreq:     resources,
-			InitResreq: resources,
-			BestEffort: isBestEffort,
-			NumaInfo: &TopologyInfo{
-				ResMap: map[int]v1.ResourceList{},
-			},
-		}
+// TestTaskSchedulingReasonNomination checks that the nomination is published
+// from the live transaction, so a rolled-back gang attempt does not leak a
+// stale NominatedNodeName while a committed preemption still keeps it.
+func TestTaskSchedulingReasonNomination(t *testing.T) {
+	tests := []struct {
+		name           string
+		live           TransactionContext
+		lastTx         *TransactionContext
+		wantNomination string
+	}{
+		{
+			name:           "committed preemption retains nomination",
+			live:           TransactionContext{Status: Pipelined, NodeName: "node1", EvictionOccurred: true},
+			lastTx:         nil,
+			wantNomination: "node1",
+		},
+		{
+			name:           "discarded attempt publishes no nomination",
+			live:           TransactionContext{Status: Pending},
+			lastTx:         &TransactionContext{Status: Pipelined, NodeName: "node1", EvictionOccurred: true},
+			wantNomination: "",
+		},
 	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := buildPod("ns1", "task-1", "", v1.PodPending, BuildResourceList("1", "1G"), nil, make(map[string]string))
+			job := NewJobInfo(JobID("job1"))
+			ti := NewTaskInfo(pod)
+			job.AddTaskInfo(ti)
+
+			ti.TransactionContext = tt.live
+			ti.LastTransaction = tt.lastTx
+
+			_, _, nominated := job.TaskSchedulingReason(ti.UID)
+			if nominated != tt.wantNomination {
+				t.Errorf("nominatedNodeName = %q, want %q", nominated, tt.wantNomination)
+			}
+		})
+	}
+}
+
+func TestJobInfo(t *testing.T) {
+	newPod := func(name, node string, phase v1.PodPhase, requests v1.ResourceList, claims []v1.PodResourceClaim) *v1.Pod {
+		pod := buildPod("c1", name, node, phase, requests, nil, map[string]string{batch.TaskSpecKey: "worker"})
+		pod.Annotations = map[string]string{schedulingv2.KubeGroupNameAnnotationKey: "job-1"}
+		pod.Spec.ResourceClaims = claims
+		for _, claim := range claims {
+			pod.Spec.Containers[0].Resources.Claims = append(pod.Spec.Containers[0].Resources.Claims, v1.ResourceClaim{Name: claim.Name})
+		}
+		return pod
+	}
+	mixedPods := []*v1.Pod{
+		newPod("pending-requestless", "", v1.PodPending, nil, nil),
+		newPod("pipelined-requestless", "", v1.PodPending, nil, nil),
+		newPod("running-requestless", "n1", v1.PodRunning, nil, nil),
+		newPod("pending-cpu", "", v1.PodPending, BuildResourceList("100m", "0"), nil),
+		newPod("pipelined-cpu", "", v1.PodPending, BuildResourceList("100m", "0"), nil),
+		newPod("running-cpu", "n1", v1.PodRunning, BuildResourceList("100m", "0"), nil),
+	}
+	directClaims := []v1.PodResourceClaim{{
+		Name:              "gpu",
+		ResourceClaimName: ptr.To("claim1"),
+	}}
+	templateClaims := []v1.PodResourceClaim{{
+		Name:                      "gpu",
+		ResourceClaimTemplateName: ptr.To("template1"),
+	}}
+	runningWorker := newPod("running", "n1", v1.PodRunning, BuildResourceList("1", "0"), nil)
 	testCases := []struct {
 		name                             string
-		jobUID                           JobID
-		jobMinAvailable                  int32
-		tasks                            []*TaskInfo
+		minMember                        int32
+		minTaskMember                    map[string]int32
+		pods                             []*v1.Pod
+		pipelineTasks                    []string
 		expectedPendingBestEffortTaskNum int32
 		expectedIsReady                  bool
 		expectedIsPipelined              bool
 		expectedIsStarving               bool
+		expectedTaskReady                bool
+		expectedTaskPipelined            bool
 	}{
 		{
-			name:            "starving job",
-			jobUID:          "job-1",
-			jobMinAvailable: 5,
-			tasks: []*TaskInfo{
-				newTaskFunc("pending-besteffort-task-1", "job-1", Pending, EmptyResource()),
-				newTaskFunc("pipelined-besteffort-task-1", "job-1", Pipelined, EmptyResource()),
-				newTaskFunc("running-besteffort-task-1", "job-1", Running, EmptyResource()),
-				newTaskFunc("pending-unbesteffort-task-1", "job-1", Pending, NewResource(v1.ResourceList{"cpu": resource.MustParse("100m")})),
-				newTaskFunc("pipelined-unbesteffort-task-1", "job-1", Pipelined, NewResource(v1.ResourceList{"cpu": resource.MustParse("100m")})),
-				newTaskFunc("running-unbesteffort-task-1", "job-1", Running, NewResource(v1.ResourceList{"cpu": resource.MustParse("100m")})),
-			},
+			name:                             "starving job",
+			minMember:                        5,
+			pods:                             mixedPods,
+			pipelineTasks:                    []string{"pipelined-requestless", "pipelined-cpu"},
 			expectedPendingBestEffortTaskNum: 1,
 			expectedIsReady:                  false,
 			expectedIsPipelined:              true,
 			expectedIsStarving:               true,
+			expectedTaskReady:                true,
+			expectedTaskPipelined:            true,
 		},
-
 		{
-			name:            "ready job",
-			jobUID:          "job-1",
-			jobMinAvailable: 3,
-			tasks: []*TaskInfo{
-				newTaskFunc("pending-besteffort-task-1", "job-1", Pending, EmptyResource()),
-				newTaskFunc("pipelined-besteffort-task-1", "job-1", Pipelined, EmptyResource()),
-				newTaskFunc("running-besteffort-task-1", "job-1", Running, EmptyResource()),
-				newTaskFunc("pending-unbesteffort-task-1", "job-1", Pending, NewResource(v1.ResourceList{"cpu": resource.MustParse("100m")})),
-				newTaskFunc("pipelined-unbesteffort-task-1", "job-1", Pipelined, NewResource(v1.ResourceList{"cpu": resource.MustParse("100m")})),
-				newTaskFunc("running-unbesteffort-task-1", "job-1", Running, NewResource(v1.ResourceList{"cpu": resource.MustParse("100m")})),
-			},
+			name:                             "ready job",
+			minMember:                        3,
+			pods:                             mixedPods,
+			pipelineTasks:                    []string{"pipelined-requestless", "pipelined-cpu"},
 			expectedPendingBestEffortTaskNum: 1,
 			expectedIsReady:                  true,
 			expectedIsPipelined:              true,
 			expectedIsStarving:               false,
+			expectedTaskReady:                true,
+			expectedTaskPipelined:            true,
+		},
+		{
+			name:          "pending requestless worker counts toward job and role readiness",
+			minMember:     2,
+			minTaskMember: map[string]int32{"worker": 2},
+			pods: []*v1.Pod{
+				runningWorker,
+				newPod("pending", "", v1.PodPending, nil, nil),
+			},
+			expectedPendingBestEffortTaskNum: 1,
+			expectedIsReady:                  true,
+			expectedIsPipelined:              true,
+			expectedIsStarving:               true,
+			expectedTaskReady:                true,
+			expectedTaskPipelined:            true,
+		},
+		{
+			name:          "pending CPU worker does not count toward job or role readiness",
+			minMember:     2,
+			minTaskMember: map[string]int32{"worker": 2},
+			pods: []*v1.Pod{
+				runningWorker,
+				newPod("pending", "", v1.PodPending, BuildResourceList("1", "0"), nil),
+			},
+			expectedIsReady:       false,
+			expectedIsPipelined:   false,
+			expectedIsStarving:    true,
+			expectedTaskReady:     false,
+			expectedTaskPipelined: false,
+		},
+		{
+			name:          "pending worker with ResourceClaim does not count toward job or role readiness",
+			minMember:     2,
+			minTaskMember: map[string]int32{"worker": 2},
+			pods: []*v1.Pod{
+				runningWorker,
+				newPod("pending", "", v1.PodPending, nil, directClaims),
+			},
+			expectedIsReady:       false,
+			expectedIsPipelined:   false,
+			expectedIsStarving:    true,
+			expectedTaskReady:     false,
+			expectedTaskPipelined: false,
+		},
+		{
+			name:          "pending worker with ResourceClaimTemplate does not count toward job or role readiness",
+			minMember:     2,
+			minTaskMember: map[string]int32{"worker": 2},
+			pods: []*v1.Pod{
+				runningWorker,
+				newPod("pending", "", v1.PodPending, nil, templateClaims),
+			},
+			expectedIsReady:       false,
+			expectedIsPipelined:   false,
+			expectedIsStarving:    true,
+			expectedTaskReady:     false,
+			expectedTaskPipelined: false,
+		},
+		{
+			name:          "running DRA worker counts toward job and role readiness",
+			minMember:     2,
+			minTaskMember: map[string]int32{"worker": 2},
+			pods: []*v1.Pod{
+				runningWorker,
+				newPod("dra", "n1", v1.PodRunning, nil, directClaims),
+			},
+			expectedIsReady:       true,
+			expectedIsPipelined:   true,
+			expectedIsStarving:    false,
+			expectedTaskReady:     true,
+			expectedTaskPipelined: true,
+		},
+		{
+			name:          "pipelined DRA worker counts toward pipeline readiness only",
+			minMember:     2,
+			minTaskMember: map[string]int32{"worker": 2},
+			pods: []*v1.Pod{
+				runningWorker,
+				newPod("dra", "", v1.PodPending, nil, directClaims),
+			},
+			pipelineTasks:         []string{"dra"},
+			expectedIsReady:       false,
+			expectedIsPipelined:   true,
+			expectedIsStarving:    false,
+			expectedTaskReady:     false,
+			expectedTaskPipelined: true,
 		},
 	}
 
 	for _, tc := range testCases {
-		jobInfo := NewJobInfo(tc.jobUID, tc.tasks...)
-		jobInfo.MinAvailable = tc.jobMinAvailable
-		actualPendingBestEffortTaskNum := jobInfo.PendingBestEffortTaskNum()
-		actualIsReady := jobInfo.IsReady()
-		actualIsPipelined := jobInfo.IsPipelined()
-		actualIsStarving := jobInfo.IsStarving()
-
-		if !assert.Equal(t, actualPendingBestEffortTaskNum, tc.expectedPendingBestEffortTaskNum) {
-			t.Errorf("unexpected PendingBestEffortTaskNum; name: %s, expected result: %v, actual result: %v", tc.name, tc.expectedPendingBestEffortTaskNum, actualPendingBestEffortTaskNum)
-		}
-		if !assert.Equal(t, actualIsReady, tc.expectedIsReady) {
-			t.Errorf("unexpected Ready; name: %s, expected result: %v, actual result: %v", tc.name, tc.expectedIsReady, actualIsReady)
-		}
-		if !assert.Equal(t, actualIsPipelined, tc.expectedIsPipelined) {
-			t.Errorf("unexpected IsPipelined; name: %s, expected result: %v, actual result: %v", tc.name, tc.expectedIsPipelined, actualIsPipelined)
-		}
-		if !assert.Equal(t, actualIsStarving, tc.expectedIsStarving) {
-			t.Errorf("unexpected IsStarving; name: %s, expected result: %v, actual result: %v", tc.name, tc.expectedIsStarving, actualIsStarving)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			jobInfo := NewJobInfo("c1/job-1")
+			jobInfo.SetPodGroup(&PodGroup{PodGroup: scheduling.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "job-1",
+					Namespace: "c1",
+				},
+				Spec: scheduling.PodGroupSpec{
+					MinMember:     tc.minMember,
+					MinTaskMember: tc.minTaskMember,
+				},
+			}})
+			pipelineTasks := sets.New(tc.pipelineTasks...)
+			for _, pod := range tc.pods {
+				task := NewTaskInfo(pod.DeepCopy())
+				jobInfo.AddTaskInfo(task)
+				if pipelineTasks.Has(pod.Name) {
+					jobInfo.UpdateTaskStatus(task, Pipelined)
+				}
+			}
+			assert.Equal(t, tc.expectedPendingBestEffortTaskNum, jobInfo.PendingBestEffortTaskNum())
+			assert.Equal(t, tc.expectedIsReady, jobInfo.IsReady())
+			assert.Equal(t, tc.expectedIsPipelined, jobInfo.IsPipelined())
+			assert.Equal(t, tc.expectedIsStarving, jobInfo.IsStarving())
+			assert.Equal(t, tc.expectedTaskReady, jobInfo.CheckTaskReady())
+			assert.Equal(t, tc.expectedTaskPipelined, jobInfo.CheckTaskPipelined())
+		})
 	}
 }
 
@@ -514,9 +996,350 @@ func TestHasTopologyHardConstrain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.jobInfo.PodGroup != nil {
+				tt.jobInfo.NetworkTopology = cloneNetworkTopology(tt.jobInfo.PodGroup.Spec.NetworkTopology)
+			}
 			hasHard, tier := tt.jobInfo.IsHardTopologyMode()
 			assert.Equal(t, tt.expectedHasHard, hasHard)
 			assert.Equal(t, tt.expectedTier, tier)
 		})
+	}
+}
+
+func TestSetPodGroupDeepCopiesNetworkTopology(t *testing.T) {
+	tier := 2
+	pg := &PodGroup{
+		PodGroup: scheduling.PodGroup{
+			Spec: scheduling.PodGroupSpec{
+				NetworkTopology: &scheduling.NetworkTopologySpec{
+					Mode:               scheduling.SoftNetworkTopologyMode,
+					HighestTierAllowed: &tier,
+					HighestTierName:    "volcano.sh/hypercluster",
+				},
+			},
+		},
+	}
+
+	job := NewJobInfo("job")
+	job.SetPodGroup(pg)
+
+	assert.NotSame(t, job.PodGroup.Spec.NetworkTopology, job.NetworkTopology)
+
+	job.NetworkTopology.Mode = scheduling.HardNetworkTopologyMode
+	job.NetworkTopology.HighestTierName = ""
+
+	assert.Equal(t, scheduling.SoftNetworkTopologyMode, job.PodGroup.Spec.NetworkTopology.Mode)
+	assert.Equal(t, "volcano.sh/hypercluster", job.PodGroup.Spec.NetworkTopology.HighestTierName)
+}
+
+func TestParseMinMemberInfoChanged(t *testing.T) {
+	tests := []struct {
+		name                          string
+		minTaskMemberInitial          map[string]int32
+		minTaskMemberChanged          map[string]int32
+		expectedTaskMinAvailable      map[string]int32
+		expectedTaskMinAvailableTotal int32
+	}{
+		{
+			name: "task member changed from single to multiple roles",
+			minTaskMemberInitial: map[string]int32{
+				"worker": 3,
+			},
+			minTaskMemberChanged: map[string]int32{
+				"master": 1,
+				"worker": 2,
+				"gpu":    1,
+			},
+			expectedTaskMinAvailable: map[string]int32{
+				"master": 1,
+				"worker": 2,
+				"gpu":    1,
+			},
+			expectedTaskMinAvailableTotal: 4,
+		},
+		{
+			name: "task member decreased",
+			minTaskMemberInitial: map[string]int32{
+				"master": 2,
+				"worker": 5,
+				"gpu":    3,
+			},
+			minTaskMemberChanged: map[string]int32{
+				"master": 1,
+				"worker": 2,
+			},
+			expectedTaskMinAvailable: map[string]int32{
+				"master": 1,
+				"worker": 2,
+			},
+			expectedTaskMinAvailableTotal: 3,
+		},
+		{
+			name: "task member increased",
+			minTaskMemberInitial: map[string]int32{
+				"worker": 2,
+			},
+			minTaskMemberChanged: map[string]int32{
+				"master": 2,
+				"worker": 5,
+				"gpu":    3,
+			},
+			expectedTaskMinAvailable: map[string]int32{
+				"master": 2,
+				"worker": 5,
+				"gpu":    3,
+			},
+			expectedTaskMinAvailableTotal: 10,
+		},
+		{
+			name: "task member replaced completely",
+			minTaskMemberInitial: map[string]int32{
+				"old-master": 1,
+				"old-worker": 3,
+			},
+			minTaskMemberChanged: map[string]int32{
+				"new-master": 1,
+				"new-worker": 3,
+			},
+			expectedTaskMinAvailable: map[string]int32{
+				"new-master": 1,
+				"new-worker": 3,
+			},
+			expectedTaskMinAvailableTotal: 4,
+		},
+		{
+			name: "task member changed to empty",
+			minTaskMemberInitial: map[string]int32{
+				"master": 1,
+				"worker": 3,
+			},
+			minTaskMemberChanged:          map[string]int32{},
+			expectedTaskMinAvailable:      map[string]int32{},
+			expectedTaskMinAvailableTotal: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jobInfo := NewJobInfo("test-job")
+			pg := &PodGroup{}
+			pg.Spec.MinTaskMember = tt.minTaskMemberInitial
+			jobInfo.ParseMinMemberInfo(pg)
+			pg.Spec.MinTaskMember = tt.minTaskMemberChanged
+			jobInfo.ParseMinMemberInfo(pg)
+
+			assert.Equal(t, tt.expectedTaskMinAvailable, jobInfo.TaskMinAvailable)
+			assert.Equal(t, tt.expectedTaskMinAvailableTotal, jobInfo.TaskMinAvailableTotal)
+		})
+	}
+}
+
+func TestGetMinDRAResourcesIdempotent(t *testing.T) {
+	job := NewJobInfo("test-job")
+	job.TaskMinAvailable["worker"] = 2
+	job.Tasks[TaskID("worker-0")] = &TaskInfo{
+		UID:      TaskID("worker-0"),
+		Name:     "worker-0",
+		TaskRole: "worker",
+		DRAResreq: map[string]*DRAResource{
+			"gpu.com": {
+				Count: 1,
+				Capacity: map[string]resource.Quantity{
+					"memory": resource.MustParse("8Gi"),
+				},
+			},
+		},
+	}
+
+	expected := map[string]*DRAResource{
+		"gpu.com": {
+			Count: 2,
+			Capacity: map[string]resource.Quantity{
+				"memory": resource.MustParse("16Gi"),
+			},
+		},
+	}
+
+	assert.Equal(t, expected, job.GetMinDRAResources())
+	assert.Equal(t, expected, job.GetMinDRAResources())
+	assert.Equal(t, map[string]int32{"worker": 2}, job.TaskMinAvailable)
+}
+
+func TestGetMinDRAResourcesFallbackWithoutTaskMinAvailable(t *testing.T) {
+	job := NewJobInfo("test-job")
+	job.MinAvailable = 2
+	job.Tasks[TaskID("task-b")] = &TaskInfo{
+		UID:       TaskID("task-b"),
+		Namespace: "ns",
+		Name:      "task-b",
+		DRAResreq: map[string]*DRAResource{
+			"gpu.com": {Count: 1},
+		},
+	}
+	job.Tasks[TaskID("task-a")] = &TaskInfo{
+		UID:       TaskID("task-a"),
+		Namespace: "ns",
+		Name:      "task-a",
+		DRAResreq: map[string]*DRAResource{
+			"gpu.com": {Count: 2},
+		},
+	}
+	job.Tasks[TaskID("task-c")] = &TaskInfo{
+		UID:       TaskID("task-c"),
+		Namespace: "ns",
+		Name:      "task-c",
+		DRAResreq: map[string]*DRAResource{
+			"gpu.com": {Count: 4},
+		},
+	}
+
+	assert.Equal(t, map[string]*DRAResource{
+		"gpu.com": {
+			Count:    3,
+			Capacity: map[string]resource.Quantity{},
+		},
+	}, job.GetMinDRAResources())
+}
+
+func TestGetMinDRAResources_constantTimeForHugeTaskMinAvailable(t *testing.T) {
+	job := NewJobInfo("test-job")
+	job.TaskMinAvailable["worker"] = math.MaxInt32
+	job.Tasks[TaskID("worker-0")] = &TaskInfo{
+		UID:      TaskID("worker-0"),
+		Name:     "worker-0",
+		TaskRole: "worker",
+		DRAResreq: map[string]*DRAResource{
+			"gpu.com": {
+				Count:    1,
+				Capacity: map[string]resource.Quantity{"memory": resource.MustParse("2Gi")},
+			},
+		},
+	}
+
+	var result map[string]*DRAResource
+	done := make(chan struct{})
+	go func() {
+		result = job.GetMinDRAResources()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetMinDRAResources did not return within 5s for TaskMinAvailable=MaxInt32")
+	}
+
+	// MaxInt32 * 2Gi is far above 1Ei.
+	got := result["gpu.com"].Capacity["memory"]
+	if got.Cmp(resource.MustParse("1Ei")) <= 0 {
+		t.Fatalf("capacity = %s for TaskMinAvailable=MaxInt32; want much greater than 1Ei", got.String())
+	}
+}
+
+func TestTaskInfoPodAnnotations(t *testing.T) {
+	tests := []struct {
+		name        string
+		task        *TaskInfo
+		existing    map[string]string
+		annotations map[string]string
+		want        map[string]string
+	}{
+		{
+			name:        "nil task ignores annotations",
+			task:        nil,
+			annotations: map[string]string{"gpu.volcano.sh/device": "0"},
+			want:        nil,
+		},
+		{
+			name:        "stores annotations on empty task",
+			task:        &TaskInfo{},
+			annotations: map[string]string{"gpu.volcano.sh/device": "0", "gpu.volcano.sh/memory": "16Gi"},
+			want:        map[string]string{"gpu.volcano.sh/device": "0", "gpu.volcano.sh/memory": "16Gi"},
+		},
+		{
+			name:        "merges annotations and overwrites existing keys",
+			task:        &TaskInfo{},
+			existing:    map[string]string{"gpu.volcano.sh/device": "0"},
+			annotations: map[string]string{"gpu.volcano.sh/device": "1", "gpu.volcano.sh/memory": "16Gi"},
+			want:        map[string]string{"gpu.volcano.sh/device": "1", "gpu.volcano.sh/memory": "16Gi"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.task != nil && tt.existing != nil {
+				tt.task.MergePodAnnotations(tt.existing)
+			}
+
+			assert.NotPanics(t, func() {
+				tt.task.MergePodAnnotations(tt.annotations)
+			})
+
+			if tt.task == nil {
+				return
+			}
+			assert.Equal(t, tt.want, tt.task.PodAnnotations)
+		})
+	}
+}
+
+func TestTaskInfoPodAnnotationsAreCloned(t *testing.T) {
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{"keep": "original"},
+		},
+	}
+	task := NewTaskInfo(pod)
+
+	task.MergePodAnnotations(map[string]string{"keep": "task", "new": "value"})
+
+	assert.Equal(t, "original", pod.Annotations["keep"])
+	assert.NotContains(t, pod.Annotations, "new")
+
+	cloned := task.Clone()
+	cloned.MergePodAnnotations(map[string]string{"keep": "clone"})
+	cloned.DeletePodAnnotations("new")
+
+	assert.Equal(t, "task", task.PodAnnotations["keep"])
+	assert.Equal(t, "value", task.PodAnnotations["new"])
+	assert.Equal(t, "clone", cloned.PodAnnotations["keep"])
+	assert.NotContains(t, cloned.PodAnnotations, "new")
+}
+
+func newTaskWithStatus(uid string, status TaskStatus, nodeName string) *TaskInfo {
+	return &TaskInfo{
+		UID: TaskID(uid),
+		TransactionContext: TransactionContext{
+			Status:   status,
+			NodeName: nodeName,
+		},
+		Resreq: EmptyResource(),
+	}
+}
+
+func TestReleasingScheduledTaskNum(t *testing.T) {
+	jobInfo := NewJobInfo("job-1",
+		newTaskWithStatus("scheduled-1", Releasing, "node-1"),
+		newTaskWithStatus("unscheduled", Releasing, ""),
+		newTaskWithStatus("scheduled-2", Releasing, "node-2"),
+		newTaskWithStatus("running", Running, "node-3"),
+	)
+
+	if got, want := jobInfo.ReleasingScheduledTaskNum(), int32(2); got != want {
+		t.Fatalf("ReleasingScheduledTaskNum() = %v, want %v", got, want)
+	}
+}
+
+func TestScheduledTaskNum(t *testing.T) {
+	jobInfo := NewJobInfo("job-1",
+		newTaskWithStatus("running", Running, ""),
+		newTaskWithStatus("bound", Bound, ""),
+		newTaskWithStatus("failed", Failed, ""),
+		newTaskWithStatus("succeeded", Succeeded, ""),
+		newTaskWithStatus("pending", Pending, ""),
+		newTaskWithStatus("releasing", Releasing, ""),
+	)
+
+	if got, want := jobInfo.ScheduledTaskNum(), int32(4); got != want {
+		t.Fatalf("ScheduledTaskNum() = %v, want %v", got, want)
 	}
 }

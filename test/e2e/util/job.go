@@ -48,6 +48,7 @@ type TaskSpec struct {
 	Limit                 v1.ResourceList
 	Affinity              *v1.Affinity
 	Labels                map[string]string
+	Annotations           map[string]string
 	Policies              []batchv1alpha1.LifecyclePolicy
 	RestartPolicy         v1.RestartPolicy
 	Tolerations           []v1.Toleration
@@ -55,6 +56,12 @@ type TaskSpec struct {
 	Taskpriority          string
 	MaxRetry              int32
 	SchGates              []v1.PodSchedulingGate
+	PartitionPolicy       *batchv1alpha1.PartitionPolicySpec
+	ResourceClaims        []v1.PodResourceClaim
+	// MinAvailable overrides the per-role minimum that the volcano-job controller
+	// would otherwise default to task.Replicas. Use this to construct jobs that
+	// exercise per-role surplus (TaskMinAvailable < Replicas).
+	MinAvailable *int32
 }
 
 type JobSpec struct {
@@ -122,9 +129,12 @@ func CreateJobWithPodGroup(ctx *TestContext, jobSpec *JobSpec,
 		}
 
 		ts := batchv1alpha1.TaskSpec{
-			Name:     name,
-			Replicas: task.Rep,
-			Policies: task.Policies,
+			Name:            name,
+			Replicas:        task.Rep,
+			MinAvailable:    task.MinAvailable,
+			Policies:        task.Policies,
+			MaxRetry:        task.MaxRetry,
+			PartitionPolicy: task.PartitionPolicy,
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:   name,
@@ -137,6 +147,7 @@ func CreateJobWithPodGroup(ctx *TestContext, jobSpec *JobSpec,
 					Affinity:          task.Affinity,
 					Tolerations:       task.Tolerations,
 					PriorityClassName: task.Taskpriority,
+					ResourceClaims:    task.ResourceClaims,
 				},
 			},
 		}
@@ -220,20 +231,25 @@ func CreateJobInner(ctx *TestContext, jobSpec *JobSpec) (*batchv1alpha1.Job, err
 			restartPolicy = task.RestartPolicy
 		}
 
+		// Note: maxRetry must be >= 0 per CRD schema validation.
+		// When task.MaxRetry is 0, keep it as 0 (no retry) instead of -1.
 		maxRetry := task.MaxRetry
-		if maxRetry == 0 {
-			maxRetry = -1
+		if maxRetry < 0 {
+			maxRetry = 0
 		}
 
 		ts := batchv1alpha1.TaskSpec{
-			Name:     name,
-			Replicas: task.Rep,
-			Policies: task.Policies,
-			MaxRetry: maxRetry,
+			Name:            name,
+			Replicas:        task.Rep,
+			MinAvailable:    task.MinAvailable,
+			Policies:        task.Policies,
+			MaxRetry:        maxRetry,
+			PartitionPolicy: task.PartitionPolicy,
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:   name,
-					Labels: task.Labels,
+					Name:        name,
+					Labels:      task.Labels,
+					Annotations: task.Annotations,
 				},
 				Spec: v1.PodSpec{
 					RestartPolicy:     restartPolicy,
@@ -242,6 +258,7 @@ func CreateJobInner(ctx *TestContext, jobSpec *JobSpec) (*batchv1alpha1.Job, err
 					Tolerations:       task.Tolerations,
 					PriorityClassName: task.Taskpriority,
 					SchedulingGates:   task.SchGates,
+					ResourceClaims:    task.ResourceClaims,
 				},
 			},
 		}
@@ -344,6 +361,7 @@ func logEventsOfPods(ctx *TestContext, pods map[string]*v1.Pod) {
 }
 
 func taskPhaseEx(ctx *TestContext, job *batchv1alpha1.Job, phase []v1.PodPhase, taskNum map[string]int) error {
+	var additionalError error
 	err := wait.Poll(100*time.Millisecond, FiveMinute, func() (bool, error) {
 
 		pods, err := ctx.Kubeclient.CoreV1().Pods(job.Namespace).List(context.TODO(), metav1.ListOptions{})
@@ -364,7 +382,9 @@ func taskPhaseEx(ctx *TestContext, job *batchv1alpha1.Job, phase []v1.PodPhase, 
 		}
 
 		for k, v := range taskNum {
-			if v > readyTaskNum[k] {
+			if readyTaskNum[k] != v {
+				additionalError = fmt.Errorf("expected job '%s' to have ready pods %v by priority class, actual got %v",
+					job.Name, taskNum, readyTaskNum)
 				return false, nil
 			}
 		}
@@ -372,7 +392,7 @@ func taskPhaseEx(ctx *TestContext, job *batchv1alpha1.Job, phase []v1.PodPhase, 
 		return true, nil
 	})
 	if err != nil && strings.Contains(err.Error(), TimeOutMessage) {
-		return fmt.Errorf("[Wait time out]")
+		return fmt.Errorf("[Wait time out]: %s", additionalError)
 	}
 	return err
 
@@ -593,7 +613,7 @@ func WaitPodPhaseRunningMoreThanNum(ctx *TestContext, namespace string, num int)
 
 func waitJobPhaseExpect(ctx *TestContext, job *batchv1alpha1.Job, state batchv1alpha1.JobPhase, waitTime time.Duration) error {
 	var additionalError error
-	err := wait.Poll(100*time.Millisecond, FiveMinute, func() (bool, error) {
+	err := wait.Poll(100*time.Millisecond, waitTime, func() (bool, error) {
 		job, err := ctx.Vcclient.BatchV1alpha1().Jobs(job.Namespace).Get(context.TODO(), job.Name, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		expected := job.Status.State.Phase == state

@@ -35,6 +35,48 @@ Create queue and bind nodegroup to it.
            preferredDuringSchedulingIgnoredDuringExecution:
            - <groupname>
    ```
+
+### Configure queue resource limits for each nodegroup
+
+Use the `volcano.sh/nodegroup-resource-limits` annotation to limit how many resources a queue can allocate from each nodegroup.
+
+```yaml
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: default
+  annotations:
+    volcano.sh/nodegroup-resource-limits: |
+      {
+        "groupname1": {"cpu": "100", "memory": "200Gi"},
+        "groupname2": {"cpu": "50"}
+      }
+spec:
+  reclaimable: true
+  weight: 1
+  affinity:
+    nodeGroupAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - groupname1
+      - groupname2
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - groupname1
+```
+
+For a task from queue `Q` scheduled to a node in nodegroup `G`, the plugin checks:
+
+```text
+allocated(Q, G) + task request <= limit(Q, G)
+```
+
+If the future usage exceeds the configured limit, the node is rejected for that task. Other allowed nodegroups remain schedulable, so the queue can prefer `groupname1` and overflow to `groupname2` when the logical limit for `groupname1` is reached.
+
+Only resource dimensions explicitly listed for a nodegroup are limited. For example, `{"groupname2": {"cpu": "50"}}` limits CPU usage in `groupname2` and does not add a memory limit for that nodegroup.
+
+If this annotation is absent, existing nodegroup behavior is unchanged. If a nodegroup is not listed in the annotation, that nodegroup has no extra limit from this feature.
+
+The annotation is not inherited by child queues when hierarchical nodegroup affinity is enabled. Each queue that needs per-nodegroup limits must define its own annotation.
+
 ### submit a vcjob
 
 submit vcjob job-1 to default queue.
@@ -110,6 +152,46 @@ tiers:
       strict: false
 ```
 
+
+### Preferred Nodegroup Priority Ordering
+
+By default, all preferred nodegroups receive the same score. When `enablePreferredOrder` is set to `true`, the order of `preferredDuringSchedulingIgnoredDuringExecution` list determines priority — earlier entries get higher scores.
+
+This is useful when you want tasks to prefer one nodegroup over another. For example, use `spark-fixed` nodes first, and only fall back to `spark-serverless` when `spark-fixed` resources are exhausted.
+
+**Scheduler configuration:**
+```yaml
+actions: "allocate, backfill, preempt, reclaim"
+tiers:
+- plugins:
+  - name: priority
+  - name: gang
+  - name: conformance
+- plugins:
+  - name: drf
+  - name: predicates
+  - name: proportion
+  - name: nodegroup
+    arguments:
+      enablePreferredOrder: true
+```
+
+**Queue configuration:**
+```yaml
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: bigdata
+spec:
+  weight: 1
+  affinity:
+    nodeGroupAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - spark-fixed        # highest priority
+      - spark-serverless   # lower priority
+```
+
+The score formula is `0.5 * BaseScore * (N - i) / N`, where `N` is the total number of preferred nodegroups and `i` is the 0-based index.
 
 ### Hierarchical Queue Configuration
 
@@ -256,13 +338,13 @@ spec:
          nodeGroupAffinity:
            requiredDuringSchedulingIgnoredDuringExecution:
            - groupname1
-           - gropuname2
+           - groupname2
            preferredDuringSchedulingIgnoredDuringExecution:
            - groupname1
          nodeGroupAntiAffinity:
            requiredDuringSchedulingIgnoredDuringExecution:
            - groupname3
-           - gropuname4
+           - groupname4
            preferredDuringSchedulingIgnoredDuringExecution:
            - groupname3
    ```
@@ -280,12 +362,12 @@ spec:
        affinity:            # added field
          nodeGroupAffinity:
            requiredDuringSchedulingIgnoredDuringExecution:
-           - gropuname2
+           - groupname2
            preferredDuringSchedulingIgnoredDuringExecution:
            - groupname1
          nodeGroupAntiAffinity:
            requiredDuringSchedulingIgnoredDuringExecution:
-           - gropuname4
+           - groupname4
            preferredDuringSchedulingIgnoredDuringExecution:
            - groupname3
    ```
@@ -303,14 +385,14 @@ spec:
          nodeGroupAffinity:
            requiredDuringSchedulingIgnoredDuringExecution:
            - groupname1
-           - gropuname2
+           - groupname2
            preferredDuringSchedulingIgnoredDuringExecution:
            - groupname1
          nodeGroupAntiAffinity:
            requiredDuringSchedulingIgnoredDuringExecution:
            - groupname1
            preferredDuringSchedulingIgnoredDuringExecution:
-           - gropuname2
+           - groupname2
    ```
    This implies that tasks in the "default" queue can only run on "groupname2".
 
@@ -327,13 +409,13 @@ spec:
          nodeGroupAffinity:
            requiredDuringSchedulingIgnoredDuringExecution:
            - groupname1
-           - gropuname2
+           - groupname2
            preferredDuringSchedulingIgnoredDuringExecution:
            - groupname1
          nodeGroupAntiAffinity:
            requiredDuringSchedulingIgnoredDuringExecution:
            - groupname3
-           - gropuname4
+           - groupname4
            preferredDuringSchedulingIgnoredDuringExecution:
            - groupname3
    ```

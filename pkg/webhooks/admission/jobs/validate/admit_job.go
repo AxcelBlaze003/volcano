@@ -25,14 +25,15 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 	k8score "k8s.io/kubernetes/pkg/apis/core"
 	k8scorev1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	k8scorevalid "k8s.io/kubernetes/pkg/apis/core/validation"
 	"k8s.io/kubernetes/pkg/capabilities"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
@@ -117,25 +118,14 @@ func AdmitJobs(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 }
 
 func validateJobCreate(job *v1alpha1.Job, reviewResponse *admissionv1.AdmissionResponse) string {
-	var msg string
-	taskNames := map[string]string{}
+	var b strings.Builder
+	taskNames := map[string]struct{}{}
 	var totalReplicas int32
 
-	if job.Spec.MinAvailable < 0 {
-		reviewResponse.Allowed = false
-		return "job 'minAvailable' must be >= 0."
-	}
-
-	if job.Spec.MaxRetry < 0 {
-		reviewResponse.Allowed = false
-		return "'maxRetry' cannot be less than zero."
-	}
-
-	if job.Spec.TTLSecondsAfterFinished != nil && *job.Spec.TTLSecondsAfterFinished < 0 {
-		reviewResponse.Allowed = false
-		return "'ttlSecondsAfterFinished' cannot be less than zero."
-	}
-
+	// Note: Basic validations like minAvailable >= 0, maxRetry >= 0, TTLSecondsAfterFinished >= 0,
+	// task.Replicas >= 0, task.MinAvailable >= 0, task.MinAvailable <= task.Replicas,
+	// job.MinAvailable <= totalReplicas, duplicate task name, task name DNS1123 format,
+	// These validations have been removed from webhook to avoid duplication.
 	if len(job.Spec.Tasks) == 0 {
 		reviewResponse.Allowed = false
 		return "No task specified in job spec"
@@ -144,69 +134,55 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *admissionv1.AdmissionR
 	if _, ok := job.Spec.Plugins[controllerMpi.MPIPluginName]; ok {
 		mp := controllerMpi.NewInstance(job.Spec.Plugins[controllerMpi.MPIPluginName])
 		masterIndex := jobhelpers.GetTaskIndexUnderJob(mp.GetMasterName(), job)
-		workerIndex := jobhelpers.GetTaskIndexUnderJob(mp.GetWorkerName(), job)
 		if masterIndex == -1 {
 			reviewResponse.Allowed = false
 			return "The specified mpi master task was not found"
 		}
-		if workerIndex == -1 {
-			reviewResponse.Allowed = false
-			return "The specified mpi worker task was not found"
-		}
 	}
 
+	b.WriteString(validateNetworkTopology(job.Spec.NetworkTopology))
 	hasDependenciesBetweenTasks := false
 	for index, task := range job.Spec.Tasks {
 		if task.DependsOn != nil {
 			hasDependenciesBetweenTasks = true
 		}
 
-		if task.Replicas < 0 {
-			msg += fmt.Sprintf(" 'replicas' < 0 in task: %s, job: %s;", task.Name, job.Name)
-		}
-
+		// Validate minAvailable and partitionPolicy.minPartitions mutual exclusivity
+		// This validation is not covered by CRD schema or VAP, so it remains in webhook.
 		if task.MinAvailable != nil {
-			if *task.MinAvailable < 0 {
-				msg += fmt.Sprintf(" 'minAvailable' < 0 in task: %s, job: %s;", task.Name, job.Name)
-			} else if *task.MinAvailable > task.Replicas {
-				msg += fmt.Sprintf(" 'minAvailable' is greater than 'replicas' in task: %s, job: %s;", task.Name, job.Name)
+			if *task.MinAvailable > task.Replicas {
+				fmt.Fprintf(&b, " 'minAvailable' is greater than 'replicas' in task: %s, job: %s;", task.Name, job.Name)
 			}
 		}
-
 		// count replicas
 		totalReplicas += task.Replicas
 
-		// validate task name
-		if errMsgs := validation.IsDNS1123Label(task.Name); len(errMsgs) > 0 {
-			msg += fmt.Sprintf(" %v;", errMsgs)
-		}
-
 		// duplicate task name
 		if _, found := taskNames[task.Name]; found {
-			msg += fmt.Sprintf(" duplicated task name %s;", task.Name)
+			fmt.Fprintf(&b, " duplicated task name %s;", task.Name)
 			break
 		} else {
-			taskNames[task.Name] = task.Name
+			taskNames[task.Name] = struct{}{}
 		}
-
 		if err := validatePolicies(task.Policies, field.NewPath("spec.tasks.policies")); err != nil {
-			msg += err.Error() + fmt.Sprintf(" valid events are %v, valid actions are %v;",
+			b.WriteString(err.Error())
+			fmt.Fprintf(&b, " valid events are %v, valid actions are %v;",
 				getValidEvents(), getValidActions())
 		}
 		podName := jobhelpers.MakePodName(job.Name, task.Name, index)
-		msg += validateK8sPodNameLength(podName)
-		msg += validateTaskTemplate(task, job, index)
-		msg += validatePartitionPolicy(task, job)
+		b.WriteString(validateK8sPodNameLength(podName))
+		b.WriteString(validateTaskTemplate(task, job, index))
+		b.WriteString(validatePartitionPolicy(task, job))
 	}
 
-	msg += validateJobName(job)
+	b.WriteString(validateJobName(job))
 
 	if totalReplicas < job.Spec.MinAvailable {
-		msg += " job 'minAvailable' should not be greater than total replicas in tasks;"
+		b.WriteString(" job 'minAvailable' should not be greater than total replicas in tasks;")
 	}
-
 	if err := validatePolicies(job.Spec.Policies, field.NewPath("spec.policies")); err != nil {
-		msg = msg + err.Error() + fmt.Sprintf(" valid events are %v, valid actions are %v;",
+		b.WriteString(err.Error())
+		fmt.Fprintf(&b, " valid events are %v, valid actions are %v;",
 			getValidEvents(), getValidActions())
 	}
 
@@ -214,56 +190,45 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *admissionv1.AdmissionR
 	if len(job.Spec.Plugins) != 0 {
 		for name := range job.Spec.Plugins {
 			if _, found := plugins.GetPluginBuilder(name); !found {
-				msg += fmt.Sprintf(" unable to find job plugin: %s;", name)
+				fmt.Fprintf(&b, " unable to find job plugin: %s;", name)
 			}
 		}
 	}
 
 	if err := validateIO(job.Spec.Volumes); err != nil {
-		msg += err.Error()
+		b.WriteString(err.Error())
 	}
 
-	queue, err := config.QueueLister.Get(job.Spec.Queue)
-	if err != nil {
-		msg += fmt.Sprintf(" unable to find job queue: %v;", err)
-	} else {
-		if queue.Status.State != schedulingv1beta1.QueueStateOpen {
-			msg += fmt.Sprintf(" can only submit job to queue with state `Open`, "+
-				"queue `%s` status is `%s`;", queue.Name, queue.Status.State)
-		}
-
-		// validate hierarchical queue
-		if queue.Name == "root" {
-			msg += " can not submit job to root queue;"
-		} else {
-			queueList, err := config.QueueLister.List(labels.Everything())
-			if err != nil {
-				msg += fmt.Sprintf("failed to get list queues: %v;", err)
-			}
-			childQueues := make([]*schedulingv1beta1.Queue, 0)
-			for _, childQueue := range queueList {
-				if childQueue.Spec.Parent == queue.Name {
-					childQueues = append(childQueues, childQueue)
-				}
-			}
-			if len(childQueues) > 0 {
-				msg += fmt.Sprintf(" can only submit job to leaf queue, "+"queue `%s` has %d child queues;", queue.Name, len(childQueues))
-			}
-		}
-	}
+	b.WriteString(validateJobQueue(job.Namespace, job.Spec.Queue))
 
 	if hasDependenciesBetweenTasks {
 		_, isDag := topoSort(job)
 		if !isDag {
-			msg += " job has dependencies between tasks, but doesn't form a directed acyclic graph(DAG);"
+			b.WriteString(" job has dependencies between tasks, but doesn't form a directed acyclic graph(DAG);")
 		}
 	}
 
-	if msg != "" {
+	if b.Len() > 0 {
 		reviewResponse.Allowed = false
 	}
 
-	return msg
+	return b.String()
+}
+
+func validateJobQueue(workloadNamespace, queueReference string) string {
+	err := util.ValidateWorkloadQueueReference(
+		workloadNamespace,
+		queueReference,
+		schedulingv1beta1.DefaultQueue,
+		config,
+		util.QueueReferenceValidationOptions{
+			RequireClusterQueueLeaf: true,
+		},
+	)
+	if err != nil {
+		return fmt.Sprintf(" invalid job queue reference: %v;", err)
+	}
+	return ""
 }
 
 func validateJobUpdate(old, new *v1alpha1.Job) error {
@@ -293,6 +258,10 @@ func validateJobUpdate(old, new *v1alpha1.Job) error {
 	}
 	if new.Spec.MinAvailable < 0 {
 		return fmt.Errorf("job 'minAvailable' must be >= 0")
+	}
+	networkTopology := new.Spec.NetworkTopology
+	if networkTopology != nil && networkTopology.HighestTierAllowed != nil && networkTopology.HighestTierName != "" {
+		return fmt.Errorf("must not specify 'highestTierAllowed' and 'highestTierName' in networkTopology simultaneously")
 	}
 
 	if len(old.Spec.Tasks) != len(new.Spec.Tasks) {
@@ -338,10 +307,23 @@ func validatePartitionPolicy(task v1alpha1.TaskSpec, job *v1alpha1.Job) string {
 			msg += fmt.Sprintf("'PartitionSize' must be greater than 0 in task: %s, job: %s", task.Name, job.Name)
 		} else if task.Replicas != task.PartitionPolicy.TotalPartitions*task.PartitionPolicy.PartitionSize {
 			msg += fmt.Sprintf("'Replicas' are not equal to TotalPartitions*PartitionSize in task: %s, job: %s", task.Name, job.Name)
+		} else if task.MinAvailable != nil && task.PartitionPolicy.MinPartitions > 0 && task.PartitionPolicy.MinPartitions*task.PartitionPolicy.PartitionSize != *task.MinAvailable {
+			// Only enforce the minAvailable == minPartitions*partitionSize relationship
+			// when minPartitions is explicitly set (> 0). When minPartitions is omitted
+			// (defaults to 0), minAvailable falls back to replicas, so skip this check.
+			msg += fmt.Sprintf("'MinAvailable' is not equal to MinPartitions*PartitionSize in task: %s, job: %s", task.Name, job.Name)
 		}
+		msg += validateNetworkTopology(task.PartitionPolicy.NetworkTopology)
 	}
 
 	return msg
+}
+
+func validateNetworkTopology(networkTopology *v1alpha1.NetworkTopologySpec) string {
+	if networkTopology != nil && networkTopology.HighestTierAllowed != nil && networkTopology.HighestTierName != "" {
+		return "must not specify 'highestTierAllowed' and 'highestTierName' in networkTopology simultaneously"
+	}
+	return ""
 }
 
 func validateTaskTemplate(task v1alpha1.TaskSpec, job *v1alpha1.Job, index int) string {
@@ -360,7 +342,9 @@ func validateTaskTemplate(task v1alpha1.TaskSpec, job *v1alpha1.Job, index int) 
 		Template: coreTemplateSpec,
 	}
 
-	opts := k8scorevalid.PodValidationOptions{}
+	opts := k8scorevalid.PodValidationOptions{
+		PodLevelResourcesEnabled: utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResources),
+	}
 	if allErrs := k8scorevalid.ValidatePodTemplate(&corePodTemplate, opts); len(allErrs) > 0 {
 		msg := fmt.Sprintf("spec.task[%d].", index)
 		for index := range allErrs {
@@ -370,11 +354,7 @@ func validateTaskTemplate(task v1alpha1.TaskSpec, job *v1alpha1.Job, index int) 
 	}
 
 	msg := validateTaskTopoPolicy(task, index)
-	if msg != "" {
-		return msg
-	}
-
-	return ""
+	return msg
 }
 
 func validateK8sPodNameLength(podName string) string {
@@ -413,7 +393,7 @@ func validateTaskTopoPolicy(task v1alpha1.TaskSpec, index int) string {
 	for id, container := range append(template.Spec.Containers, template.Spec.InitContainers...) {
 		requestNum := guaranteedCPUs(container)
 		if requestNum == 0 {
-			return fmt.Sprintf("the cpu request isn't  an integer in spec.task[%d] container[%d].",
+			return fmt.Sprintf("the cpu request isn't an integer in spec.task[%d] container[%d].",
 				index, id)
 		}
 	}

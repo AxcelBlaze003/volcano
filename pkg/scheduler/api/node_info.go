@@ -19,6 +19,8 @@ package api
 import (
 	"fmt"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -27,7 +29,8 @@ import (
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/apis/pkg/apis/scheduling/v1beta1"
-	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/ascend310p/vnpu"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/hami"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/mindcluster/ascend310p/vnpu"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/gpushare"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/vgpu"
 )
@@ -67,11 +70,11 @@ type NodeInfo struct {
 	Capacity      *Resource
 	ResourceUsage *NodeUsage
 
-	Tasks             map[TaskID]*TaskInfo
-	NumaInfo          *NumatopoInfo
-	NumaChgFlag       NumaChgFlag
-	NumaSchedulerInfo *NumatopoInfo
-	RevocableZone     string
+	Tasks              map[TaskID]*TaskInfo
+	NumaInfo           *NumatopoInfo
+	UnassignedNumaPods map[PodMeta]ResNumaSets
+	NumaSchedulerInfo  *NumatopoInfo
+	RevocableZone      string
 
 	// Used to store custom information
 	Others map[string]interface{}
@@ -89,6 +92,12 @@ type NodeInfo struct {
 	// checking an image's existence and advanced usage (e.g., image locality scheduling policy) based on the image
 	// state information.
 	ImageStates map[string]*fwk.ImageStateSummary
+
+	// Generation is incremented every time the cache is updated (node add/update/delete)
+	Generation int64
+
+	// BindGeneration is used to check conflict before binding
+	BindGeneration int64
 }
 
 // PodGroupOldState records podgroup old state
@@ -175,29 +184,35 @@ func NewNodeInfo(node *v1.Node) *NodeInfo {
 	return nodeInfo
 }
 
-// RefreshNumaSchedulerInfoByCrd used to update scheduler numa information based the CRD numatopo
+// RefreshNumaSchedulerInfoByCrd used to update scheduler numa information based the numatopo CRD
 func (ni *NodeInfo) RefreshNumaSchedulerInfoByCrd() {
 	if ni.NumaInfo == nil {
 		ni.NumaSchedulerInfo = nil
+		klog.V(5).Infof("set numa scheduler info of node %s to nil", ni.Name)
 		return
 	}
+	klog.V(5).Infof("numa info of node %s is %v", ni.Name, ni.NumaInfo)
 
-	tmp := ni.NumaInfo.DeepCopy()
-	if ni.NumaChgFlag == NumaInfoMoreFlag {
-		ni.NumaSchedulerInfo = tmp
-	} else if ni.NumaChgFlag == NumaInfoLessFlag {
-		numaResMap := ni.NumaSchedulerInfo.NumaResMap
-		for resName, resInfo := range tmp.NumaResMap {
-			klog.V(5).Infof("resource %s Allocatable : current %v new %v on node %s",
-				resName, numaResMap[resName], resInfo, ni.Name)
-			if numaResMap[resName].Allocatable.Size() >= resInfo.Allocatable.Size() {
-				numaResMap[resName].Allocatable = resInfo.Allocatable.Clone()
-				numaResMap[resName].Capacity = resInfo.Capacity
-			}
+	unassignedNumber := 0
+	for podMeta, resSets := range ni.UnassignedNumaPods {
+		if !ni.NumaInfo.CheckNumaPodAssigned(podMeta) {
+			klog.V(3).Infof("pod %v is scheduled to node %s, but has not been assigned numa resources, will pre-occupy resources %v", podMeta, ni.Name, resSets)
+			unassignedNumber++
 		}
 	}
 
-	ni.NumaChgFlag = NumaInfoResetFlag
+	tmp := ni.NumaInfo.DeepCopy()
+	// Only clear UnassignedNumaPods when every entry has been assigned, because volcano's allocation decision may differ from kubelet's.
+	// Otherwise, volcano may lose some allocation info and dispatch a pod that kubelet rejects with TopologyAffinityError.
+	if unassignedNumber == 0 {
+		ni.UnassignedNumaPods = nil
+	} else {
+		for podMeta, resSets := range ni.UnassignedNumaPods {
+			klog.V(3).Infof("because of the presence of unassigned %d pods, pod %v still pre-occupies resources %v on node %s", unassignedNumber, podMeta, resSets, ni.Name)
+			tmp.Allocate(resSets)
+		}
+	}
+	ni.NumaSchedulerInfo = tmp
 }
 
 // Clone used to clone nodeInfo Object
@@ -214,6 +229,12 @@ func (ni *NodeInfo) Clone() *NodeInfo {
 		res.ResourceUsage = ni.ResourceUsage.DeepCopy()
 	}
 
+	if ni.UnassignedNumaPods != nil {
+		res.UnassignedNumaPods = make(map[PodMeta]ResNumaSets, len(ni.UnassignedNumaPods))
+		for podMeta, resSets := range ni.UnassignedNumaPods {
+			res.UnassignedNumaPods[podMeta] = resSets.Clone()
+		}
+	}
 	if ni.NumaSchedulerInfo != nil {
 		res.NumaSchedulerInfo = ni.NumaSchedulerInfo.DeepCopy()
 		klog.V(5).Infof("node[%s]", ni.Name)
@@ -228,6 +249,7 @@ func (ni *NodeInfo) Clone() *NodeInfo {
 
 	res.Others = ni.CloneOthers()
 	res.ImageStates = ni.CloneImageSummary()
+	res.BindGeneration = ni.BindGeneration
 	return res
 }
 
@@ -282,15 +304,33 @@ func (ni *NodeInfo) setOversubscription(node *v1.Node) {
 			}
 			klog.V(5).Infof("Set node %s OfflineJobEvicting to %v", node.Name, ni.OfflineJobEvicting)
 		}
-		if value, found := node.Annotations[OversubscriptionCPU]; found {
-			ni.OversubscriptionResource.MilliCPU, _ = strconv.ParseFloat(value, 64)
-			klog.V(5).Infof("Set node %s Oversubscription CPU to %v", node.Name, ni.OversubscriptionResource.MilliCPU)
-		}
-		if value, found := node.Annotations[OversubscriptionMemory]; found {
-			ni.OversubscriptionResource.Memory, _ = strconv.ParseFloat(value, 64)
-			klog.V(5).Infof("Set node %s Oversubscription Memory to %v", node.Name, ni.OversubscriptionResource.Memory)
-		}
 	}
+	ni.OversubscriptionResource = nodeOversubscriptionResource(node)
+	klog.V(5).Infof("Set node %s Oversubscription resource to %v", node.Name, ni.OversubscriptionResource)
+}
+
+// NewNodeAllocatable returns the Node resources used by Volcano's built-in
+// resource-fit check, including legacy CPU and memory oversubscription
+// annotations.
+func NewNodeAllocatable(node *v1.Node) *Resource {
+	if node == nil {
+		return EmptyResource()
+	}
+	return NewResource(node.Status.Allocatable).Add(nodeOversubscriptionResource(node))
+}
+
+func nodeOversubscriptionResource(node *v1.Node) *Resource {
+	resource := EmptyResource()
+	if node == nil {
+		return resource
+	}
+	if value, found := node.Annotations[OversubscriptionCPU]; found {
+		resource.MilliCPU, _ = strconv.ParseFloat(value, 64)
+	}
+	if value, found := node.Annotations[OversubscriptionMemory]; found {
+		resource.Memory, _ = strconv.ParseFloat(value, 64)
+	}
+	return resource
 }
 
 func (ni *NodeInfo) setNodeState(node *v1.Node) {
@@ -324,19 +364,6 @@ func (ni *NodeInfo) SetNode(node *v1.Node) {
 			ni.Name, ni.State.Phase, ni.State.Reason)
 		return
 	}
-
-	// Dry run, make sure all fields other than `State` are in the original state.
-	copy := ni.Clone()
-	copy.setNode(node)
-	copy.setNodeState(node)
-	if !copy.Ready() {
-		klog.Warningf("SetNode makes node %s not ready, phase: %s, reason: %s",
-			copy.Name, copy.State.Phase, copy.State.Reason)
-		// Set state of node to !Ready, left other fields untouched
-		ni.State = copy.State
-		return
-	}
-
 	ni.setNode(node)
 }
 
@@ -346,15 +373,40 @@ func (ni *NodeInfo) setNodeOthersResource(node *v1.Node) {
 		klog.Warningf("received argument of nil node, no need to set other resources for %s", ni.Name)
 		return
 	}
-
-	ni.Others[gpushare.DeviceName] = gpushare.NewGPUDevices(ni.Name, node)
-	ni.Others[vgpu.DeviceName] = vgpu.NewGPUDevices(ni.Name, node)
-	ni.Others[vnpu.DeviceName] = vnpu.NewNPUDevices(ni.Name, node)
-	IgnoredDevicesList.Set(
-		ni.Others[gpushare.DeviceName].(Devices).GetIgnoredDevices(),
-		ni.Others[vgpu.DeviceName].(Devices).GetIgnoredDevices(),
-		ni.Others[vnpu.DeviceName].(Devices).GetIgnoredDevices(),
+	ignored_list := []string{}
+	if gpushare.GpuSharingEnable || gpushare.GpuNumberEnable {
+		gpuDevices := gpushare.NewGPUDevices(ni.Name, node)
+		if gpuDevices != nil {
+			ni.Others[gpushare.DeviceName] = gpuDevices
+			ignored_list = append(ignored_list, gpuDevices.GetIgnoredDevices()...)
+		} else {
+			delete(ni.Others, gpushare.DeviceName)
+		}
+	}
+	if vgpu.VGPUEnable {
+		gpuDevices := vgpu.NewGPUDevices(ni.Name, node)
+		if gpuDevices != nil {
+			ni.Others[vgpu.DeviceName] = gpuDevices
+			ignored_list = append(ignored_list, gpuDevices.GetIgnoredDevices()...)
+		} else {
+			delete(ni.Others, vgpu.DeviceName)
+		}
+	}
+	if vnpu.AscendMindClusterVNPUEnable {
+		ni.Others[vnpu.DeviceName] = vnpu.NewNPUDevices(ni.Name, node)
+		ignored_list = append(ignored_list, vnpu.NewNPUDevices(ni.Name, node).GetIgnoredDevices()...)
+	}
+	if hami.AscendHAMiVNPUEnable {
+		for deviceName, devices := range hami.NewAscendDevices(ni.Name, node) {
+			ni.Others[deviceName] = devices
+			ignored_list = append(ignored_list, devices.GetIgnoredDevices()...)
+		}
+	}
+	klog.V(5).Infof("ignored_list is %v", ignored_list)
+	IgnoredDevicesList.AppendList(
+		ignored_list,
 	)
+	klog.V(5).Infof("ignoredDevicesList is %v", IgnoredDevicesList.List())
 }
 
 // setNode sets kubernetes node object to nodeInfo object without assertion
@@ -379,7 +431,6 @@ func (ni *NodeInfo) setNode(node *v1.Node) {
 			ni.allocateIdleResource(ti)
 			ni.Releasing.Add(ti.Resreq)
 			ni.Used.Add(ti.Resreq)
-			ni.addResource(ti.Pod)
 		case Pipelined:
 			ni.Pipelined.Add(ti.Resreq)
 		default:
@@ -427,7 +478,6 @@ func (ni *NodeInfo) AddTask(task *TaskInfo) error {
 			ni.allocateIdleResource(ti)
 			ni.Releasing.Add(ti.Resreq)
 			ni.Used.Add(ti.Resreq)
-			ni.addResource(ti.Pod)
 		case Pipelined:
 			ni.Pipelined.Add(ti.Resreq)
 		case Binding:
@@ -445,10 +495,6 @@ func (ni *NodeInfo) AddTask(task *TaskInfo) error {
 		}
 	}
 
-	if ni.NumaInfo != nil {
-		ni.NumaInfo.AddTask(ti)
-	}
-
 	// Update task node name upon successful task addition.
 	task.NodeName = ni.Name
 	ti.NodeName = ni.Name
@@ -458,16 +504,14 @@ func (ni *NodeInfo) AddTask(task *TaskInfo) error {
 }
 
 // RemoveTask used to remove a task from nodeInfo object.
-//
-// If error occurs both task and node are guaranteed to be in the original state.
-func (ni *NodeInfo) RemoveTask(ti *TaskInfo) error {
+func (ni *NodeInfo) RemoveTask(ti *TaskInfo) {
 	key := PodKey(ti.Pod)
 
 	task, found := ni.Tasks[key]
 	if !found {
 		klog.Warningf("failed to find task <%v/%v> on host <%v>",
 			ti.Namespace, ti.Name, ni.Name)
-		return nil
+		return
 	}
 
 	if ni.Node != nil {
@@ -476,7 +520,6 @@ func (ni *NodeInfo) RemoveTask(ti *TaskInfo) error {
 			ni.Releasing.Sub(task.Resreq)
 			ni.Idle.Add(task.Resreq)
 			ni.Used.Sub(task.Resreq)
-			ni.subResource(ti.Pod)
 		case Pipelined:
 			ni.Pipelined.Sub(task.Resreq)
 		default:
@@ -486,13 +529,7 @@ func (ni *NodeInfo) RemoveTask(ti *TaskInfo) error {
 		}
 	}
 
-	if ni.NumaInfo != nil {
-		ni.NumaInfo.RemoveTask(ti)
-	}
-
 	delete(ni.Tasks, key)
-
-	return nil
 }
 
 // addResource is used to add sharable devices
@@ -503,51 +540,100 @@ func (ni *NodeInfo) addResource(pod *v1.Pod) {
 
 	// Add an if judgment condition to fix the panic.
 	if gpushare.GpuSharingEnable || gpushare.GpuNumberEnable {
-		ni.Others[gpushare.DeviceName].(Devices).AddResource(pod)
+		if other, exists := ni.Others[gpushare.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.AddResource(pod)
+			}
+		}
 	}
-	ni.Others[vgpu.DeviceName].(Devices).AddResource(pod)
-	ni.Others[vnpu.DeviceName].(Devices).AddResource(pod)
+	if vgpu.VGPUEnable {
+		if other, exists := ni.Others[vgpu.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.AddResource(pod)
+			}
+		}
+	}
+	if vnpu.AscendMindClusterVNPUEnable {
+		if other, exists := ni.Others[vnpu.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.AddResource(pod)
+			}
+		}
+	}
+	if hami.AscendHAMiVNPUEnable {
+		for _, name := range hami.GetAscendDeviceNames() {
+			if other, exists := ni.Others[name]; exists {
+				if devices, ok := other.(Devices); ok {
+					devices.AddResource(pod)
+				}
+			}
+		}
+	}
 }
 
 // subResource is used to subtract sharable devices
 func (ni *NodeInfo) subResource(pod *v1.Pod) {
 	if gpushare.GpuSharingEnable || gpushare.GpuNumberEnable {
-		ni.Others[gpushare.DeviceName].(Devices).SubResource(pod)
+		if other, exists := ni.Others[gpushare.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.SubResource(pod)
+			}
+		}
 	}
-	ni.Others[vgpu.DeviceName].(Devices).SubResource(pod)
-	ni.Others[vnpu.DeviceName].(Devices).SubResource(pod)
+	if vgpu.VGPUEnable {
+		if other, exists := ni.Others[vgpu.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.SubResource(pod)
+			}
+		}
+	}
+	if vnpu.AscendMindClusterVNPUEnable {
+		if other, exists := ni.Others[vnpu.DeviceName]; exists {
+			if devices, ok := other.(Devices); ok {
+				devices.SubResource(pod)
+			}
+		}
+	}
+	if hami.AscendHAMiVNPUEnable {
+		for _, name := range hami.GetAscendDeviceNames() {
+			if other, exists := ni.Others[name]; exists {
+				if devices, ok := other.(Devices); ok {
+					devices.SubResource(pod)
+				}
+			}
+		}
+	}
 }
 
 // UpdateTask is used to update a task in nodeInfo object.
-//
-// If error occurs both task and node are guaranteed to be in the original state.
-func (ni *NodeInfo) UpdateTask(ti *TaskInfo) error {
-	if err := ni.RemoveTask(ti); err != nil {
-		return err
-	}
-
+func (ni *NodeInfo) UpdateTask(ti *TaskInfo) {
+	ni.RemoveTask(ti)
 	if err := ni.AddTask(ti); err != nil {
 		// This should never happen if task removal was successful,
 		// because only possible error during task addition is when task is still on a node.
 		klog.Fatalf("Failed to add Task <%s,%s> to Node <%s> during task update",
 			ti.Namespace, ti.Name, ni.Name)
 	}
-	return nil
 }
 
 // String returns nodeInfo details in string format
 func (ni NodeInfo) String() string {
-	tasks := ""
+	var b strings.Builder
 
 	i := 0
 	for _, task := range ni.Tasks {
-		tasks += fmt.Sprintf("\n\t %d: %v", i, task)
+		fmt.Fprintf(&b, "\n\t %d: %v", i, task)
 		i++
+	}
+
+	var taints []v1.Taint
+	if ni.Node != nil {
+		taints = ni.Node.Spec.Taints
 	}
 
 	return fmt.Sprintf("Node (%s): allocatable<%v> idle <%v>, used <%v>, releasing <%v>, oversubscribution <%v>, "+
 		"state <phase %s, reaseon %s>, oversubscributionNode <%v>, offlineJobEvicting <%v>,taints <%v>%s, imageStates %v",
-		ni.Name, ni.Allocatable, ni.Idle, ni.Used, ni.Releasing, ni.OversubscriptionResource, ni.State.Phase, ni.State.Reason, ni.OversubscriptionNode, ni.OfflineJobEvicting, ni.Node.Spec.Taints, tasks, ni.ImageStates)
+		ni.Name, ni.Allocatable, ni.Idle, ni.Used, ni.Releasing, ni.OversubscriptionResource, ni.State.Phase, ni.State.Reason, ni.OversubscriptionNode, ni.OfflineJobEvicting, taints, b.String(), ni.ImageStates)
 }
 
 // Pods returns all pods running in that node
@@ -572,13 +658,25 @@ func (ni *NodeInfo) CloneImageSummary() map[string]*fwk.ImageStateSummary {
 	return nodeImageStates
 }
 
-// CloneOthers clone other map resources
+// CloneOthers clone other map resources using deepcopy
 func (ni *NodeInfo) CloneOthers() map[string]interface{} {
 	others := make(map[string]interface{})
 	for k, v := range ni.Others {
-		others[k] = v
+		if d, ok := v.(Devices); ok {
+			if IsNilDevice(d) {
+				others[k] = v
+				continue
+			}
+			others[k] = d.DeepCopy()
+		} else {
+			others[k] = v
+		}
 	}
 	return others
+}
+
+func (ni *NodeInfo) NextBindGeneration() {
+	atomic.AddInt64(&ni.BindGeneration, 1)
 }
 
 // Clone clone csi node status info

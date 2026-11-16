@@ -22,13 +22,17 @@ package framework
 
 import (
 	"context"
+	"errors"
+	"sort"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
-	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/volcano/pkg/controllers/job/helpers"
 	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/unschedulable"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
@@ -59,12 +63,26 @@ func (ssn *Session) AddTaskOrderFn(name string, cf api.CompareFn) {
 
 // AddPreemptableFn add preemptable function
 func (ssn *Session) AddPreemptableFn(name string, cf api.EvictableFn) {
+	if ssn.preemptableFns == nil {
+		ssn.preemptableFns = map[string]api.EvictableFn{}
+	}
 	ssn.preemptableFns[name] = cf
 }
 
 // AddReclaimableFn add Reclaimable function
 func (ssn *Session) AddReclaimableFn(name string, rf api.EvictableFn) {
+	if ssn.reclaimableFns == nil {
+		ssn.reclaimableFns = map[string]api.EvictableFn{}
+	}
 	ssn.reclaimableFns[name] = rf
+}
+
+// AddUnifiedEvictableFn registers a UnifiedEvictableFn for gang-aware victim filtering.
+func (ssn *Session) AddUnifiedEvictableFn(name string, fn api.UnifiedEvictableFn) {
+	if ssn.unifiedEvictableFns == nil {
+		ssn.unifiedEvictableFns = map[string]api.UnifiedEvictableFn{}
+	}
+	ssn.unifiedEvictableFns[name] = fn
 }
 
 // AddJobReadyFn add JobReady function
@@ -80,6 +98,11 @@ func (ssn *Session) AddJobPipelinedFn(name string, vf api.VoteFn) {
 // AddPredicateFn add Predicate function
 func (ssn *Session) AddPredicateFn(name string, pf api.PredicateFn) {
 	ssn.predicateFns[name] = pf
+}
+
+// AddQueueNodeFilterFn adds a session-stable queue node filter.
+func (ssn *Session) AddQueueNodeFilterFn(name string, fn api.QueueNodeFilterFn) {
+	ssn.queueNodeFilterFns[name] = fn
 }
 
 // AddPrePredicateFn add PrePredicate function
@@ -183,6 +206,31 @@ func (ssn *Session) AddSimulatePredicateFn(name string, fn api.SimulatePredicate
 	ssn.simulatePredicateFns[name] = fn
 }
 
+// AddSubJobReadyFn add SubJobReady function
+func (ssn *Session) AddSubJobReadyFn(name string, vf api.ValidateFn) {
+	ssn.subJobReadyFns[name] = vf
+}
+
+// AddSubJobPipelinedFn add SubJobPipelined function
+func (ssn *Session) AddSubJobPipelinedFn(name string, vf api.VoteFn) {
+	ssn.subJobPipelinedFns[name] = vf
+}
+
+// AddSubJobOrderFn add SubJobOrderFn function
+func (ssn *Session) AddSubJobOrderFn(name string, fn api.CompareFn) {
+	ssn.subJobOrderFns[name] = fn
+}
+
+// AddHyperNodeGradientForJobFn add HyperNodeGradientForJobFn function
+func (ssn *Session) AddHyperNodeGradientForJobFn(name string, fn api.HyperNodeGradientForJobFn) {
+	ssn.hyperNodeGradientForJobFns[name] = fn
+}
+
+// AddHyperNodeGradientForSubJobFn add HyperNodeGradientForSubJobFn function
+func (ssn *Session) AddHyperNodeGradientForSubJobFn(name string, fn api.HyperNodeGradientForSubJobFn) {
+	ssn.hyperNodeGradientForSubJobFns[name] = fn
+}
+
 // Reclaimable invoke reclaimable function of the plugins
 func (ssn *Session) Reclaimable(reclaimer *api.TaskInfo, reclaimees []*api.TaskInfo) []*api.TaskInfo {
 	var victims []*api.TaskInfo
@@ -282,6 +330,47 @@ func (ssn *Session) Preemptable(preemptor *api.TaskInfo, preemptees []*api.TaskI
 	return victims
 }
 
+// UnifiedEvictable invokes UnifiedEvictableFn plugins for gang-aware victim filtering.
+// Tier walking and intersection semantics match Preemptable/Reclaimable.
+func (ssn *Session) UnifiedEvictable(ctx *api.EvictionContext, candidates []*api.TaskInfo) []*api.TaskInfo {
+	var victims []*api.TaskInfo
+
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			fn, found := ssn.unifiedEvictableFns[plugin.Name]
+			if !found {
+				continue
+			}
+			result, abstain := fn(ctx, candidates)
+			if abstain == 0 {
+				continue
+			}
+			if len(result) == 0 {
+				victims = nil
+				break
+			}
+			if victims == nil {
+				victims = result
+			} else {
+				var intersection []*api.TaskInfo
+				for _, v := range victims {
+					for _, c := range result {
+						if v.UID == c.UID {
+							intersection = append(intersection, v)
+						}
+					}
+				}
+				victims = intersection
+			}
+		}
+		if victims != nil {
+			return victims
+		}
+	}
+
+	return victims
+}
+
 // Overused invoke overused function of the plugins
 func (ssn *Session) Overused(queue *api.QueueInfo) bool {
 	for _, tier := range ssn.Tiers {
@@ -302,8 +391,8 @@ func (ssn *Session) Overused(queue *api.QueueInfo) bool {
 	return false
 }
 
-// Preemptive invoke can preemptive function of the plugins
-func (ssn *Session) Preemptive(queue *api.QueueInfo, candidate *api.TaskInfo) bool {
+// Preemptive invokes preemptive functions of the plugins.
+func (ssn *Session) Preemptive(queue *api.QueueInfo, candidates []*api.TaskInfo) bool {
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			of, found := ssn.preemptiveFns[plugin.Name]
@@ -313,7 +402,7 @@ func (ssn *Session) Preemptive(queue *api.QueueInfo, candidate *api.TaskInfo) bo
 			if !found {
 				continue
 			}
-			if !of(queue, candidate) {
+			if !of(queue, candidates) {
 				return false
 			}
 		}
@@ -334,8 +423,69 @@ func (ssn *Session) Allocatable(queue *api.QueueInfo, candidate *api.TaskInfo) b
 				continue
 			}
 			if !af(queue, candidate) {
+				if ssn.unschedulableJobCacheEnabled && candidate.Job != "" {
+					ssn.AddRejection(candidate.Job, plugin.Name, unschedulable.RejectionAllocatable, candidate.UID)
+				}
 				return false
 			}
+		}
+	}
+
+	return true
+}
+
+func (ssn *Session) SubJobReady(job *api.JobInfo, subJob *api.SubJobInfo) bool {
+	if !job.ContainsSubJobPolicy() {
+		return ssn.JobReady(job)
+	}
+
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledSubJobReady) {
+				continue
+			}
+			fn, found := ssn.subJobReadyFns[plugin.Name]
+			if !found {
+				continue
+			}
+
+			if !fn(subJob) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func (ssn *Session) SubJobPipelined(job *api.JobInfo, subJob *api.SubJobInfo) bool {
+	if !job.ContainsSubJobPolicy() {
+		return ssn.JobPipelined(job)
+	}
+
+	var hasFound bool
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledSubJobPipelined) {
+				continue
+			}
+			fn, found := ssn.subJobPipelinedFns[plugin.Name]
+			if !found {
+				continue
+			}
+
+			res := fn(subJob)
+			if res < 0 {
+				return false
+			}
+			if res > 0 {
+				hasFound = true
+			}
+		}
+		// if plugin exists that votes permit, meanwhile other plugin votes abstention,
+		// permit job to be pipelined, do not check next tier
+		if hasFound {
+			return true
 		}
 	}
 
@@ -456,6 +606,11 @@ func (ssn *Session) JobEnqueueable(obj interface{}) bool {
 
 			res := fn(obj)
 			if res < 0 {
+				if ssn.unschedulableJobCacheEnabled {
+					if job, ok := obj.(*api.JobInfo); ok {
+						ssn.AddRejection(job.UID, plugin.Name, unschedulable.RejectionEnqueue)
+					}
+				}
 				return false
 			}
 			if res > 0 {
@@ -549,8 +704,35 @@ func (ssn *Session) ReservedNodes() {
 	}
 }
 
-// JobOrderFn invoke joborder function of the plugins
-func (ssn *Session) JobOrderFn(l, r interface{}) bool {
+func (ssn *Session) SubJobOrderFn(l, r interface{}) bool {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledSubJobOrder) {
+				continue
+			}
+			fn, found := ssn.subJobOrderFns[plugin.Name]
+			if !found {
+				continue
+			}
+			if j := fn(l, r); j != 0 {
+				return j < 0
+			}
+		}
+	}
+
+	// If no subJob order funcs, order subJob by MatchIndex and UID.
+	lv := l.(*api.SubJobInfo)
+	rv := r.(*api.SubJobInfo)
+	if lv.MatchIndex != rv.MatchIndex {
+		return lv.MatchIndex < rv.MatchIndex
+	}
+	return lv.UID < rv.UID
+}
+
+// JobOrderCompareFn compares l and r by running enabled JobOrder plugins in
+// order and returning the first non-zero comparison result. It returns 0 if
+// all plugins consider l and r equal.
+func (ssn *Session) JobOrderCompareFn(l, r interface{}) int {
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			if !isEnabled(plugin.EnabledJobOrder) {
@@ -561,9 +743,18 @@ func (ssn *Session) JobOrderFn(l, r interface{}) bool {
 				continue
 			}
 			if j := jof(l, r); j != 0 {
-				return j < 0
+				return j
 			}
 		}
+	}
+
+	return 0
+}
+
+// JobOrderFn invoke joborder function of the plugins
+func (ssn *Session) JobOrderFn(l, r interface{}) bool {
+	if res := ssn.JobOrderCompareFn(l, r); res != 0 {
+		return res < 0
 	}
 
 	// If no job order funcs, order job by CreationTimestamp first, then by UID.
@@ -671,6 +862,28 @@ func (ssn *Session) TaskOrderFn(l, r interface{}) bool {
 	lv := l.(*api.TaskInfo)
 	rv := r.(*api.TaskInfo)
 	return helpers.CompareTask(lv, rv)
+}
+
+// QueueNodeFilterFn narrows candidate nodes before per-task predicates are evaluated,
+// using queue-level constraints that remain valid throughout the session.
+// Implementations must preserve input order and must not add nodes or modify the input.
+func (ssn *Session) QueueNodeFilterFn(queue *api.QueueInfo, nodes []*api.NodeInfo) []*api.NodeInfo {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			enabled := plugin.EnabledQueueNodeFilter
+			// Preserve existing predicate settings unless the filter is explicitly configured.
+			if enabled == nil {
+				enabled = plugin.EnabledPredicate
+			}
+			if !isEnabled(enabled) {
+				continue
+			}
+			if fn, found := ssn.queueNodeFilterFns[plugin.Name]; found {
+				nodes = fn(queue, nodes)
+			}
+		}
+	}
+	return nodes
 }
 
 // PredicateFn invoke predicate function of the plugins
@@ -785,9 +998,16 @@ func (ssn *Session) PrePredicateFn(task *api.TaskInfo) error {
 				continue
 			}
 			err := pfn(task)
-			if err != nil {
-				return err
+			if err == nil {
+				continue
 			}
+			if ssn.unschedulableJobCacheEnabled {
+				var rejection *api.PrePredicateError
+				if errors.As(err, &rejection) {
+					ssn.AddRejection(task.Job, rejection.Plugin, unschedulable.RejectionPredicate, task.UID)
+				}
+			}
+			return err
 		}
 	}
 	return nil
@@ -892,7 +1112,7 @@ func (ssn *Session) NodeOrderMapFn(task *api.TaskInfo, node *api.NodeInfo) (map[
 }
 
 // HyperNodeOrderMapFn invoke hyperNode order function of the plugins
-func (ssn *Session) HyperNodeOrderMapFn(job *api.JobInfo, hyperNodes map[string][]*api.NodeInfo) (map[string]map[string]float64, error) {
+func (ssn *Session) HyperNodeOrderMapFn(subJob *api.SubJobInfo, hyperNodes map[string][]*api.NodeInfo) (map[string]map[string]float64, error) {
 	nodeGroupScore := make(map[string]map[string]float64)
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
@@ -903,7 +1123,7 @@ func (ssn *Session) HyperNodeOrderMapFn(job *api.JobInfo, hyperNodes map[string]
 			if !found {
 				continue
 			}
-			scoreTmp, err := pfn(job, hyperNodes)
+			scoreTmp, err := pfn(subJob, hyperNodes)
 			if err != nil {
 				return nodeGroupScore, err
 			}
@@ -915,7 +1135,7 @@ func (ssn *Session) HyperNodeOrderMapFn(job *api.JobInfo, hyperNodes map[string]
 }
 
 // NodeOrderReduceFn invoke node order function of the plugins
-func (ssn *Session) NodeOrderReduceFn(task *api.TaskInfo, pluginNodeScoreMap map[string]k8sframework.NodeScoreList) (map[string]float64, error) {
+func (ssn *Session) NodeOrderReduceFn(task *api.TaskInfo, pluginNodeScoreMap map[string]fwk.NodeScoreList) (map[string]float64, error) {
 	nodeScoreMap := map[string]float64{}
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
@@ -937,10 +1157,177 @@ func (ssn *Session) NodeOrderReduceFn(task *api.TaskInfo, pluginNodeScoreMap map
 	return nodeScoreMap, nil
 }
 
+// HyperNodeGradientForJobFn intersects gradients from every enabled registered plugin.
+func (ssn *Session) HyperNodeGradientForJobFn(job *api.JobInfo, hyperNode *api.HyperNodeInfo, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, *api.HyperNodeGradientStats) {
+	var gradientByPlugin []api.HyperNodePluginGradient
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledHyperNodeGradient) {
+				continue
+			}
+			fn, found := ssn.hyperNodeGradientForJobFns[plugin.Name]
+			if !found {
+				continue
+			}
+			result := fn(job, hyperNode, purpose)
+			gradientByPlugin = append(gradientByPlugin, api.HyperNodePluginGradient{
+				PluginName: plugin.Name, Unconstrained: result.Unconstrained, Gradients: result.Gradients,
+			})
+		}
+	}
+	return ssn.resolveHyperNodeGradients(gradientByPlugin, hyperNode, purpose)
+}
+
+// HyperNodeGradientForSubJobFn intersects gradients from every enabled registered plugin.
+func (ssn *Session) HyperNodeGradientForSubJobFn(subJob *api.SubJobInfo, hyperNode *api.HyperNodeInfo, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, *api.HyperNodeGradientStats) {
+	var gradientByPlugin []api.HyperNodePluginGradient
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledHyperNodeGradient) {
+				continue
+			}
+			fn, found := ssn.hyperNodeGradientForSubJobFns[plugin.Name]
+			if !found {
+				continue
+			}
+			result := fn(subJob, hyperNode, purpose)
+			gradientByPlugin = append(gradientByPlugin, api.HyperNodePluginGradient{
+				PluginName: plugin.Name, Unconstrained: result.Unconstrained, Gradients: result.Gradients,
+			})
+		}
+	}
+	return ssn.resolveHyperNodeGradients(gradientByPlugin, hyperNode, purpose)
+}
+
+// resolveHyperNodeGradients distinguishes absent callbacks, unconstrained results,
+// and constrained results (including rejection). Only constrained plugins
+// participate in intersection and exclusion diagnostics.
+func (ssn *Session) resolveHyperNodeGradients(gradientByPlugin []api.HyperNodePluginGradient, root *api.HyperNodeInfo, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, *api.HyperNodeGradientStats) {
+	if len(gradientByPlugin) == 0 {
+		return [][]*api.HyperNodeInfo{{root}}, nil
+	}
+	constrained := gradientByPlugin[:0]
+	for _, result := range gradientByPlugin {
+		if result.Unconstrained {
+			if len(result.Gradients) == 0 {
+				continue
+			}
+			klog.ErrorS(nil, "Unconstrained HyperNode gradient contains candidates; treating as rejected", "plugin", result.PluginName, "purpose", purpose)
+			result.Unconstrained = false
+			result.Gradients = nil
+		}
+		constrained = append(constrained, result)
+	}
+	if len(constrained) > 0 {
+		return intersectHyperNodeGradients(constrained, purpose)
+	}
+
+	// All callbacks permit the input subtree. Expand it once so preferred rules
+	// can still score candidates even when no plugin supplies a concrete gradient.
+	hyperNodeByName := make(map[string]*api.HyperNodeInfo)
+	eligible := sets.New[string]()
+	queue := []*api.HyperNodeInfo{root}
+	for len(queue) > 0 {
+		hn := queue[0]
+		queue = queue[1:]
+		if hn == nil || eligible.Has(hn.Name) {
+			continue
+		}
+		eligible.Insert(hn.Name)
+		hyperNodeByName[hn.Name] = hn
+		for child := range hn.Children {
+			if childHN := ssn.HyperNodes[child]; childHN != nil {
+				queue = append(queue, childHN)
+			}
+		}
+	}
+	gradients := rebuildGradientsByTier(hyperNodeByName, eligible, purpose)
+	return gradients, &api.HyperNodeGradientStats{
+		PluginEligibleByTier: map[string]map[int]int{},
+		IntersectedByTier:    hyperNodeCountByTier(gradients),
+	}
+}
+
+func hyperNodeCountByTier(gradients [][]*api.HyperNodeInfo) map[int]int {
+	counts := make(map[int]int)
+	for _, layer := range gradients {
+		for _, hn := range layer {
+			if hn != nil {
+				counts[hn.Tier()]++
+			}
+		}
+	}
+	return counts
+}
+
+func intersectHyperNodeGradients(gradientByPlugin []api.HyperNodePluginGradient, purpose api.SearchPurpose) ([][]*api.HyperNodeInfo, *api.HyperNodeGradientStats) {
+	stats := &api.HyperNodeGradientStats{PluginEligibleByTier: make(map[string]map[int]int, len(gradientByPlugin))}
+	for _, pluginGradient := range gradientByPlugin {
+		stats.PluginEligibleByTier[pluginGradient.PluginName] = hyperNodeCountByTier(pluginGradient.Gradients)
+	}
+
+	eligible := api.HyperNodeNamesInGradients(gradientByPlugin[0].Gradients)
+	for i := 1; i < len(gradientByPlugin); i++ {
+		eligible = eligible.Intersection(api.HyperNodeNamesInGradients(gradientByPlugin[i].Gradients))
+	}
+	stats.ExcludedByReason = api.ComputePluginExcludedHyperNodes(gradientByPlugin, eligible)
+	if eligible.Len() == 0 {
+		stats.IntersectedByTier = map[int]int{}
+		return [][]*api.HyperNodeInfo{}, stats
+	}
+
+	hyperNodeByName := make(map[string]*api.HyperNodeInfo, eligible.Len())
+	for _, layer := range gradientByPlugin[0].Gradients {
+		for _, hn := range layer {
+			if hn != nil && eligible.Has(hn.Name) {
+				hyperNodeByName[hn.Name] = hn
+			}
+		}
+	}
+	result := rebuildGradientsByTier(hyperNodeByName, eligible, purpose)
+	stats.IntersectedByTier = hyperNodeCountByTier(result)
+	return result, stats
+}
+
+func rebuildGradientsByTier(hyperNodeByName map[string]*api.HyperNodeInfo, eligible sets.Set[string], purpose api.SearchPurpose) [][]*api.HyperNodeInfo {
+	byTier := make(map[int][]*api.HyperNodeInfo)
+	for name := range eligible {
+		if hn := hyperNodeByName[name]; hn != nil {
+			byTier[hn.Tier()] = append(byTier[hn.Tier()], hn)
+		}
+	}
+	tiers := make([]int, 0, len(byTier))
+	for tier := range byTier {
+		tiers = append(tiers, tier)
+		sort.Slice(byTier[tier], func(i, j int) bool { return byTier[tier][i].Name < byTier[tier][j].Name })
+	}
+	sort.Ints(tiers)
+	if purpose == api.PurposeEvict {
+		sort.Sort(sort.Reverse(sort.IntSlice(tiers)))
+	}
+	result := make([][]*api.HyperNodeInfo, 0, len(tiers))
+	for _, tier := range tiers {
+		result = append(result, byTier[tier])
+	}
+	return result
+}
+
 // BuildVictimsPriorityQueue returns a priority queue with victims sorted by:
-// if victims has same job id, sorted by !ssn.TaskOrderFn
-// if victims has different job id, sorted by !ssn.JobOrderFn
+//  1. If victims belong to the same job, use !ssn.TaskOrderFn.
+//  2. If either victim's job is missing, evict orphaned tasks first; if both
+//     are orphaned, use !ssn.TaskOrderFn.
+//  3. If the preemptor job is missing or victims are in the same queue, compare
+//     jobs with JobOrderCompareFn and use !ssn.TaskOrderFn as a tie-break.
+//  4. If victims are in different queues and preemptor job exists, use
+//     ssn.VictimQueueOrderFn.
 func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor *api.TaskInfo) *util.PriorityQueue {
+	jobThenTaskOrder := func(lvJob, rvJob *api.JobInfo, l, r interface{}) bool {
+		if cmp := ssn.JobOrderCompareFn(lvJob, rvJob); cmp != 0 {
+			return cmp > 0
+		}
+		return !ssn.TaskOrderFn(l, r)
+	}
+
 	victimsQueue := util.NewPriorityQueue(func(l, r interface{}) bool {
 		lv := l.(*api.TaskInfo)
 		rv := r.(*api.TaskInfo)
@@ -952,11 +1339,34 @@ func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor
 		rvJob, rvJobFound := ssn.Jobs[rv.Job]
 		preemptorJob, preemptorJobFound := ssn.Jobs[preemptor.Job]
 
-		if lvJobFound && rvJobFound && preemptorJobFound && lvJob.Queue != rvJob.Queue {
+		// Handle orphaned tasks whose PodGroups were deleted after the session
+		// snapshot was taken but before BuildVictimsPriorityQueue was called.
+		//
+		// Race condition scenario:
+		// 1. Session captures a snapshot of jobs/tasks at scheduling cycle start
+		// 2. PodGroup gets deleted concurrently, removing the job from ssn.Jobs
+		// 3. Here, ssn.Jobs[task.Job] returns nil for the orphaned task
+		//
+		// Sorting priority:
+		// - Both jobs missing: compare using TaskOrderFn (creation timestamp)
+		// - One job missing: evict orphaned task first (its PodGroup is gone anyway)
+		// - Both jobs present: use normal JobOrderFn comparison below
+		if !lvJobFound || !rvJobFound {
+			if !lvJobFound && !rvJobFound {
+				return !ssn.TaskOrderFn(l, r)
+			}
+			return !lvJobFound
+		}
+
+		if !preemptorJobFound {
+			return jobThenTaskOrder(lvJob, rvJob, l, r)
+		}
+
+		if lvJob.Queue != rvJob.Queue {
 			return ssn.VictimQueueOrderFn(ssn.Queues[lvJob.Queue], ssn.Queues[rvJob.Queue], ssn.Queues[preemptorJob.Queue])
 		}
 
-		return !ssn.JobOrderFn(lvJob, rvJob)
+		return jobThenTaskOrder(lvJob, rvJob, l, r)
 	})
 	for _, victim := range victims {
 		victimsQueue.Push(victim)
@@ -967,4 +1377,91 @@ func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor
 // RegisterBinder registers the passed binder to the cache, the binder type can be such as pre-binder, post-binder
 func (ssn *Session) RegisterBinder(name string, binder interface{}) {
 	ssn.cache.RegisterBinder(name, binder)
+}
+
+// AddHintProvider registers events that may make Jobs rejected by a plugin schedulable.
+func (ssn *Session) AddHintProvider(pluginName string, p unschedulable.HintProvider) {
+	if !ssn.unschedulableJobCacheEnabled {
+		return
+	}
+	ssn.unschedulableJobCache.AddHintProvider(pluginName, p)
+}
+
+// applyCachedSkips derives each pending Job's Skip decision from the
+// unschedulable-job cache at OpenSession. Jobs without a cached record keep the
+// zero-value Skip and are evaluated normally.
+func (ssn *Session) applyCachedSkips() {
+	if !ssn.unschedulableJobCacheEnabled {
+		return
+	}
+	for _, job := range ssn.Jobs {
+		rejections := ssn.unschedulableJobCache.CachedRejections(job)
+		if len(rejections) == 0 {
+			continue
+		}
+		job.Skip = unschedulable.ComputeSkip(job, rejections)
+		klog.V(4).Infof("Job %s cached skip: enqueue=%v allocate=%v tasks=%d",
+			job.UID, job.Skip.Enqueue, job.Skip.Allocate, len(job.Skip.Tasks))
+	}
+}
+
+// reconcileUnschedulableCache updates the unschedulable-job cache at CloseSession
+// to match what actually happened to each Job this session.
+func (ssn *Session) reconcileUnschedulableCache() {
+	if !ssn.unschedulableJobCacheEnabled {
+		return
+	}
+	for jobID, job := range ssn.Jobs {
+		// A pipelined Job must remain visible to allocate/preempt in the next
+		// session. Do not cache even if another task was freshly rejected.
+		if len(job.TaskStatusIndex[api.Pipelined]) > 0 {
+			ssn.unschedulableJobCache.Forget(jobID)
+			continue
+		}
+
+		// Cache fresh rejections even when an elastic Job is already ready. Its
+		// rejected surplus tasks are still redundant work, while ComputeSkip
+		// keeps the Job eligible to schedule every other pending task.
+		if rejections := ssn.rejectionsForJob(jobID); len(rejections) > 0 {
+			scope := ssn.queueScope(job.Queue)
+			for i := range rejections {
+				rejections[i].Queues = scope
+			}
+			ssn.unschedulableJobCache.Record(job, rejections)
+			continue
+		}
+
+		// No fresh rejections: if the Job was skipped this session, leave its
+		// existing record untouched. This includes ready elastic Jobs whose
+		// surplus rejected tasks were intentionally skipped.
+		if job.Skip.Skipped() {
+			continue
+		}
+
+		ssn.unschedulableJobCache.Forget(jobID)
+	}
+}
+
+// queueScope returns queueID together with its ancestor queues, walking
+// Queue.Spec.Parent through ssn.Queues. Quota-plugin hints use the result to
+// scope Queue-local changes. The walk stops at the root, a missing parent, or a
+// cycle.
+func (ssn *Session) queueScope(queueID api.QueueID) []api.QueueID {
+	scope := []api.QueueID{queueID}
+	seen := map[api.QueueID]struct{}{queueID: {}}
+	current := queueID
+	for {
+		qi, ok := ssn.Queues[current]
+		if !ok || qi.Queue == nil || qi.Queue.Spec.Parent == "" {
+			break
+		}
+		parent := api.QueueID(qi.Queue.Spec.Parent)
+		if _, dup := seen[parent]; dup {
+			break
+		}
+		seen[parent] = struct{}{}
+		scope = append(scope, parent)
+		current = parent
+	}
+	return scope
 }

@@ -17,12 +17,16 @@
 package api
 
 import (
+	"reflect"
+	"slices"
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/ascend310p/vnpu"
+	"volcano.sh/volcano/pkg/scheduler/api/devices"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/hami"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/mindcluster/ascend310p/vnpu"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/gpushare"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/vgpu"
 )
@@ -62,27 +66,52 @@ type Devices interface {
 	// scheduling policies.
 	ScoreNode(pod *v1.Pod, policy string) float64
 
-	// Allocate action in predicate
-	Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) error
-	// Release action in predicate
-	Release(kubeClient kubernetes.Interface, pod *v1.Pod) error
+	// Allocate action in predicate.
+	// Returns the reservation data produced by this allocation, including annotations
+	// that need to be carried during binding. Implementations that do not need bind
+	// annotations may return (nil, nil).
+	Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) (*devices.DeviceReservation, error)
+
+	// Release action in predicate.
+	// Rolls back the in-memory ledger and optionally returns annotation keys that
+	// should be removed from TaskInfo.PodAnnotations. The implementation owns any
+	// apiserver-side annotation cleanup it performs.
+	Release(kubeClient kubernetes.Interface, pod *v1.Pod) (*devices.DeviceReservation, error)
 
 	// GetIgnoredDevices notify vc-scheduler to ignore devices in return list
 	GetIgnoredDevices() []string
 
 	// GetStatus used for debug and monitor
 	GetStatus() string
+
+	// DeepCopy returns a deep copy of this device object for use in dry-run
+	// simulation (e.g. topology-aware preemption).  The return type is
+	// interface{} to avoid circular imports: each device package does not
+	// import the top-level api package.
+	DeepCopy() interface{}
 }
 
 // make sure GPUDevices implements Devices interface
 var _ Devices = new(gpushare.GPUDevices)
 var _ Devices = new(vgpu.GPUDevices)
 var _ Devices = new(vnpu.NPUDevices)
+var _ Devices = new(hami.AscendDevices)
 
-var RegisteredDevices = []string{
-	gpushare.DeviceName,
-	vgpu.DeviceName,
-	vnpu.DeviceName,
+var RegisteredDevices = []string{}
+
+func RegisterDevice(deviceName string) {
+	for _, name := range RegisteredDevices {
+		if name == deviceName {
+			return
+		}
+	}
+	RegisteredDevices = append(RegisteredDevices, deviceName)
+}
+
+// IsNilDevice reports whether d wraps a typed-nil pointer.
+func IsNilDevice(d Devices) bool {
+	rv := reflect.ValueOf(d)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
 }
 
 var IgnoredDevicesList = ignoredDevicesList{}
@@ -97,7 +126,45 @@ func (l *ignoredDevicesList) Set(deviceLists ...[]string) {
 	defer l.Unlock()
 	l.ignoredDevices = l.ignoredDevices[:0]
 	for _, devices := range deviceLists {
-		l.ignoredDevices = append(l.ignoredDevices, devices...)
+		for _, device := range devices {
+			if device == "" {
+				continue
+			}
+			if exists := slices.Contains(l.ignoredDevices, device); exists {
+				continue
+			}
+			l.ignoredDevices = append(l.ignoredDevices, device)
+		}
+	}
+}
+
+func (l *ignoredDevicesList) Append(devices ...string) {
+	l.Lock()
+	defer l.Unlock()
+	for _, device := range devices {
+		if device == "" {
+			continue
+		}
+		if exists := slices.Contains(l.ignoredDevices, device); exists {
+			continue
+		}
+		l.ignoredDevices = append(l.ignoredDevices, device)
+	}
+}
+
+func (l *ignoredDevicesList) AppendList(devicesLists ...[]string) {
+	l.Lock()
+	defer l.Unlock()
+	for _, devices := range devicesLists {
+		for _, device := range devices {
+			if device == "" {
+				continue
+			}
+			if exists := slices.Contains(l.ignoredDevices, device); exists {
+				continue
+			}
+			l.ignoredDevices = append(l.ignoredDevices, device)
+		}
 	}
 }
 
@@ -109,4 +176,12 @@ func (l *ignoredDevicesList) Range(f func(i int, device string) bool) {
 			break
 		}
 	}
+}
+
+func (l *ignoredDevicesList) List() []string {
+	l.RLock()
+	defer l.RUnlock()
+	devices := make([]string, len(l.ignoredDevices))
+	copy(devices, l.ignoredDevices)
+	return devices
 }

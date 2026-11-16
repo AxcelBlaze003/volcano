@@ -38,6 +38,7 @@ import (
 	fakevcClient "volcano.sh/apis/pkg/client/clientset/versioned/fake"
 	"volcano.sh/volcano/cmd/scheduler/app/options"
 	schedulingapi "volcano.sh/volcano/pkg/scheduler/api"
+	schedulercache "volcano.sh/volcano/pkg/schedulercommon/cache"
 )
 
 // NewCustomMockSchedulerCache returns a mock scheduler cache with custom interface
@@ -48,6 +49,7 @@ func NewCustomMockSchedulerCache(schedulerName string,
 	PodGroupBinder BatchBinder,
 	recorder record.EventRecorder,
 ) *SchedulerCache {
+	options.Default() // init options first because cache may reference server opts in options
 	msc := newMockSchedulerCache(schedulerName)
 	// add all events handlers
 	msc.addEventHandler()
@@ -65,12 +67,23 @@ func NewCustomMockSchedulerCache(schedulerName string,
 // Notes that default events recorder's buffer only has a length 100;
 // when use it do performance test, should use a &FakeRecorder{} without length limit to avoid block
 func NewDefaultMockSchedulerCache(schedulerName string) *SchedulerCache {
+	options.Default() // init options first because cache may reference server opts in options
 	msc := newMockSchedulerCache(schedulerName)
 	// add all events handlers
 	msc.addEventHandler()
 	checkAndSetDefaultInterface(msc)
 	msc.HyperNodesInfo = schedulingapi.NewHyperNodesInfo(msc.nodeInformer.Lister())
 	return msc
+}
+
+// ShutdownMockSchedulerCache releases the workqueues created by the mock cache
+// constructors. Call it after closing all Sessions using the cache. Closing a
+// Session alone does not stop these queues or their background goroutines.
+func ShutdownMockSchedulerCache(sc *SchedulerCache) {
+	sc.errTasks.ShutDown()
+	sc.nodeQueue.ShutDown()
+	sc.DeletedJobs.ShutDown()
+	sc.hyperNodesQueue.ShutDown()
 }
 
 func checkAndSetDefaultInterface(sc *SchedulerCache) {
@@ -117,23 +130,26 @@ func getNodeWorkers() uint32 {
 // newMockSchedulerCache init the mock scheduler cache structure
 func newMockSchedulerCache(schedulerName string) *SchedulerCache {
 	msc := &SchedulerCache{
-		Jobs:                make(map[schedulingapi.JobID]*schedulingapi.JobInfo),
-		Nodes:               make(map[string]*schedulingapi.NodeInfo),
-		Queues:              make(map[schedulingapi.QueueID]*schedulingapi.QueueInfo),
-		PriorityClasses:     make(map[string]*schedulingv1.PriorityClass),
-		errTasks:            workqueue.NewTypedRateLimitingQueue[string](workqueue.DefaultTypedControllerRateLimiter[string]()),
-		nodeQueue:           workqueue.NewTypedRateLimitingQueue[string](workqueue.DefaultTypedControllerRateLimiter[string]()),
-		DeletedJobs:         workqueue.NewTypedRateLimitingQueue[*schedulingapi.JobInfo](workqueue.DefaultTypedControllerRateLimiter[*schedulingapi.JobInfo]()),
-		hyperNodesQueue:     workqueue.NewTypedRateLimitingQueue[string](workqueue.DefaultTypedControllerRateLimiter[string]()),
-		kubeClient:          fake.NewSimpleClientset(),
-		vcClient:            fakevcClient.NewSimpleClientset(),
-		restConfig:          nil,
-		defaultQueue:        "default",
-		schedulerNames:      []string{schedulerName},
-		nodeSelectorLabels:  make(map[string]sets.Empty),
-		NamespaceCollection: make(map[string]*schedulingapi.NamespaceCollection),
-		CSINodesStatus:      make(map[string]*schedulingapi.CSINodeStatusInfo),
-		imageStates:         make(map[string]*imageState),
+		Jobs:                   make(map[schedulingapi.JobID]*schedulingapi.JobInfo),
+		Nodes:                  make(map[string]*schedulingapi.NodeInfo),
+		Queues:                 make(map[schedulingapi.QueueID]*schedulingapi.QueueInfo),
+		PriorityClasses:        make(map[string]*schedulingv1.PriorityClass),
+		errTasks:               workqueue.NewTypedRateLimitingQueue[string](workqueue.DefaultTypedControllerRateLimiter[string]()),
+		nodeQueue:              workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[schedulercache.QueueObjectWrapper]()),
+		DeletedJobs:            workqueue.NewTypedRateLimitingQueue[string](workqueue.DefaultTypedControllerRateLimiter[string]()),
+		hyperNodesQueue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[schedulercache.QueueObjectWrapper]()),
+		kubeClient:             fake.NewSimpleClientset(),
+		vcClient:               fakevcClient.NewSimpleClientset(),
+		restConfig:             nil,
+		defaultQueue:           "default",
+		schedulerNames:         []string{schedulerName},
+		nodeSelectorLabels:     make(map[string]sets.Empty),
+		NamespaceCollection:    make(map[string]*schedulingapi.NamespaceCollection),
+		CSINodesStatus:         make(map[string]*schedulingapi.CSINodeStatusInfo),
+		imageStates:            make(map[string]*imageState),
+		InUseNodesInShard:      sets.Set[string]{},
+		shardUpdateCoordinator: NewShardUpdateCoordinator(),
+		NodeShards:             make(map[string]*schedulingapi.NodeShardInfo),
 
 		NodeList:       []string{},
 		binderRegistry: NewBinderRegistry(),
@@ -158,22 +174,29 @@ func (sc *SchedulerCache) initMockInformers() {
 	// Create node informer
 	sc.nodeInformer = informerFactory.Core().V1().Nodes()
 
+	// Create PVC informer (required by addPodCSIVolumesToTask for pods
+	// referencing a PersistentVolumeClaim). Materialise via Informer() so
+	// SharedInformerFactory.Start actually starts it — matches the real
+	// newSchedulerCache wiring.
+	sc.pvcInformer = informerFactory.Core().V1().PersistentVolumeClaims()
+	sc.pvcInformer.Informer()
+
 	// Initialize DRA manager if feature is enabled
 	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.DynamicResourceAllocation) {
 		ctx := context.TODO()
 		logger := klog.FromContext(ctx)
 		resourceClaimInformer := informerFactory.Resource().V1().ResourceClaims().Informer()
 		resourceClaimCache := assumecache.NewAssumeCache(logger, resourceClaimInformer, "ResourceClaim", "", nil)
+		sc.resourceClaimCache = resourceClaimCache
 		resourceSliceTrackerOpts := resourceslicetracker.Options{
-			EnableDeviceTaints: utilfeature.DefaultFeatureGate.Enabled(kubefeatures.DRADeviceTaints),
-			SliceInformer:      informerFactory.Resource().V1().ResourceSlices(),
-			KubeClient:         sc.kubeClient,
+			EnableDeviceTaintRules: utilfeature.DefaultFeatureGate.Enabled(kubefeatures.DRADeviceTaintRules),
+			SliceInformer:          informerFactory.Resource().V1().ResourceSlices(),
+			KubeClient:             sc.kubeClient,
 		}
 		// If device taints are disabled, the additional informers are not needed and
 		// the tracker turns into a simple wrapper around the slice informer.
-		if resourceSliceTrackerOpts.EnableDeviceTaints {
-			resourceSliceTrackerOpts.TaintInformer = informerFactory.Resource().V1alpha3().DeviceTaintRules()
-			resourceSliceTrackerOpts.ClassInformer = informerFactory.Resource().V1().DeviceClasses()
+		if resourceSliceTrackerOpts.EnableDeviceTaintRules {
+			resourceSliceTrackerOpts.TaintInformer = informerFactory.Resource().V1().DeviceTaintRules()
 		}
 		resourceSliceTracker, err := resourceslicetracker.StartTracker(ctx, resourceSliceTrackerOpts)
 		if err != nil {

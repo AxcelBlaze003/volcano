@@ -37,13 +37,14 @@ const (
 	defaultCronJobWorkers      = 3
 	defaultMaxRequeueNum       = 15
 	defaultSchedulerName       = "volcano"
+	agentSchedulerName         = "agent-scheduler"
 	defaultHealthzAddress      = ":11251"
 	defaultListenAddress       = ":8081"
 	defaultLockObjectNamespace = "volcano-system"
 	defaultPodGroupWorkers     = 5
 	defaultQueueWorkers        = 5
 	defaultGCWorkers           = 1
-	defaultControllers         = "*"
+	defaultControllers         = "*,-sharding-controller"
 )
 
 // ServerOption is the main context object for the controllers.
@@ -64,9 +65,9 @@ type ServerOption struct {
 	// concurrently. Larger number = faster job updating, but more CPU load.
 	WorkerThreads           uint32
 	WorkerThreadsForCronJob uint32
-	// MaxRequeueNum is the number of times a job, queue or command will be requeued before it is dropped out of the queue.
+	// MaxRequeueNum is the number of times a job, queue, NamespaceQueue or command will be requeued before it is dropped out of the queue.
 	// With the current rate-limiter in use (5ms*2^(maxRetries-1)) the following numbers represent the times
-	// a job, queue or command is going to be requeued:
+	// a job, queue, NamespaceQueue or command is going to be requeued:
 	// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.3s, 2.6s, 5.1s, 10.2s, 20.4s, 41s, 82s
 	MaxRequeueNum  int
 	SchedulerNames []string
@@ -121,7 +122,7 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet, knownControllers []string) {
 		"Larger number = faster job updating, but more CPU load")
 	fs.Uint32Var(&s.WorkerThreadsForCronJob, "worker-threads-for-cronjob", defaultCronJobWorkers, "The number of threads syncing cronjob operations. The larger the number, the faster the cronjob processing, but requires more CPU load.")
 	fs.StringArrayVar(&s.SchedulerNames, "scheduler-name", []string{defaultSchedulerName}, "Volcano will handle pods whose .spec.SchedulerName is same as scheduler-name")
-	fs.IntVar(&s.MaxRequeueNum, "max-requeue-num", defaultMaxRequeueNum, "The number of times a job, queue or command will be requeued before it is dropped out of the queue")
+	fs.IntVar(&s.MaxRequeueNum, "max-requeue-num", defaultMaxRequeueNum, "The number of times a job, queue, NamespaceQueue or command will be requeued before it is dropped out of the queue")
 	fs.StringVar(&s.HealthzBindAddress, "healthz-address", defaultHealthzAddress, "The address to listen on for the health check server.")
 	fs.BoolVar(&s.EnableHealthz, "enable-healthz", false, "Enable the health check; it is false by default")
 	fs.BoolVar(&s.EnableMetrics, "enable-metrics", false, "Enable the metrics function; it is false by default")
@@ -130,7 +131,7 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet, knownControllers []string) {
 	fs.Uint32Var(&s.WorkerThreadsForPG, "worker-threads-for-podgroup", defaultPodGroupWorkers, "The number of threads syncing podgroup operations. The larger the number, the faster the podgroup processing, but requires more CPU load.")
 	fs.Uint32Var(&s.WorkerThreadsForGC, "worker-threads-for-gc", defaultGCWorkers, "The number of threads for recycling jobs. The larger the number, the faster the job recycling, but requires more CPU load.")
 	fs.Uint32Var(&s.WorkerThreadsForQueue, "worker-threads-for-queue", defaultQueueWorkers, "The number of threads syncing queue operations. The larger the number, the faster the queue processing, but requires more CPU load.")
-	fs.StringSliceVar(&s.Controllers, "controllers", []string{defaultControllers}, fmt.Sprintf("Specify controller gates. Use '*' for all controllers, all knownController: %s ,and we can use "+
+	fs.StringSliceVar(&s.Controllers, "controllers", strings.Split(defaultControllers, ","), fmt.Sprintf("Specify controller gates. Use '*' for all controllers, all knownController: %s ,and we can use "+
 		"'-' to disable controllers, e.g. \"-job-controller,-queue-controller\" to disable job and queue controllers.", knownControllers))
 }
 
@@ -158,10 +159,7 @@ func (s *ServerOption) checkControllers() error {
 	existenceMap := make(map[string]bool)
 	for _, c := range s.Controllers {
 		if c == "*" {
-			// wildcard '*' is not allowed to be combined with other input
-			if len(s.Controllers) > 1 {
-				return fmt.Errorf("wildcard '*' cannot be combined with other input")
-			}
+			continue
 		} else {
 			if strings.HasPrefix(c, "-") || strings.HasPrefix(c, "+") {
 				if existenceMap[c[1:]] {

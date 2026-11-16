@@ -71,9 +71,11 @@ type PluginOption struct {
 	// EnabledQueueOrder defines whether queueOrderFn is enabled
 	EnabledQueueOrder *bool `yaml:"enableQueueOrder"`
 	// EnableClusterOrder defines whether clusterOrderFn is enabled
-	EnabledClusterOrder *bool `yaml:"EnabledClusterOrder"`
+	EnabledClusterOrder *bool `yaml:"enabledClusterOrder"`
 	// EnabledPredicate defines whether predicateFn is enabled
 	EnabledPredicate *bool `yaml:"enablePredicate"`
+	// EnabledQueueNodeFilter defines whether queueNodeFilterFn is enabled; defaults to EnabledPredicate.
+	EnabledQueueNodeFilter *bool `yaml:"enableQueueNodeFilter"`
 	// EnabledBestNode defines whether bestNodeFn is enabled
 	EnabledBestNode *bool `yaml:"enableBestNode"`
 	// EnabledNodeOrder defines whether NodeOrderFn is enabled
@@ -94,6 +96,14 @@ type PluginOption struct {
 	EnabledAllocatable *bool `yaml:"enabledAllocatable"`
 	// EnabledHyperNodeOrder defines whether hyperNode is enabled
 	EnabledHyperNodeOrder *bool `yaml:"enabledHyperNodeOrder"`
+	// EnabledSubJobReady defines whether subJobReadyFn is enabled
+	EnabledSubJobReady *bool `yaml:"enabledSubJobReady"`
+	// EnabledSubJobPipelined defines whether subJobPipelinedFn is enabled
+	EnabledSubJobPipelined *bool `yaml:"enabledSubJobPipelined"`
+	// EnabledSubJobOrder defines whether subJobOrderFn is enabled
+	EnabledSubJobOrder *bool `yaml:"enabledSubJobOrder"`
+	// EnabledHyperNodeGradient defines whether hyperNodeGradientFn is enabled
+	EnabledHyperNodeGradient *bool `yaml:"enabledHyperNodeGradient"`
 	// Arguments defines the different arguments that can be given to different plugins
 	Arguments map[string]interface{} `yaml:"arguments"`
 }

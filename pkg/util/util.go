@@ -17,22 +17,33 @@ limitations under the License.
 package util
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	cliflag "k8s.io/component-base/cli/flag"
+	basecompatibility "k8s.io/component-base/compatibility"
 	"k8s.io/component-base/config"
 	"k8s.io/component-base/metrics/legacyregistry"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spf13/pflag"
 )
 
 const (
 	defaultSchedulerName       = "volcano"
 	defaultLockObjectNamespace = "volcano-system"
+	HardShardingMode           = "hard"
+	SoftShardingMode           = "soft"
+	NoneShardingMode           = "none"
 )
 
 var (
@@ -75,4 +86,48 @@ func PromHandler() http.Handler {
 	prometheus.DefaultRegisterer.Unregister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	prometheus.DefaultRegisterer.Unregister(collectors.NewGoCollector())
 	return promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, promhttp.HandlerFor(prometheus.Gatherers{prometheus.DefaultGatherer, legacyregistry.DefaultGatherer}, promhttp.HandlerOpts{}))
+}
+
+// AddFeatureGatesFlag registers --feature-gates without validating the overrides,
+// because which gates are locked depends on the cluster version.
+func AddFeatureGatesFlag(fs *pflag.FlagSet, featureGates *map[string]bool) {
+	utilfeature.DefaultMutableFeatureGate.Close()
+	fs.Var(cliflag.NewMapStringBool(featureGates), "feature-gates", "A set of key=value pairs that describe feature gates for alpha/experimental features. "+
+		"Options are:\n"+strings.Join(utilfeature.DefaultMutableFeatureGate.KnownFeatures(), "\n"))
+}
+
+// SetupComponentGlobals discovers the API server version and sets
+// Volcano's effective version + feature gate defaults to match the cluster,
+// then applies the --feature-gates overrides against those definitions.
+// This makes defaults (like DRA) correct on older clusters.
+func SetupComponentGlobals(config *restclient.Config, featureGates map[string]bool) error {
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	serverVersion, err := client.Discovery().ServerVersion()
+	if err != nil {
+		return err
+	}
+
+	kubeVersion := fmt.Sprintf("%s.%s", serverVersion.Major, serverVersion.Minor)
+	kubeEffectiveVersion := basecompatibility.NewEffectiveVersionFromString(kubeVersion, "", "")
+
+	componentGlobalsRegistry := basecompatibility.NewComponentGlobalsRegistry()
+	if componentGlobalsRegistry.EffectiveVersionFor(basecompatibility.DefaultKubeComponent) == nil {
+		err = componentGlobalsRegistry.Register(
+			basecompatibility.DefaultKubeComponent,
+			kubeEffectiveVersion,
+			utilfeature.DefaultMutableFeatureGate,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to register component globals: %w", err)
+		}
+	}
+
+	if err := componentGlobalsRegistry.Set(); err != nil {
+		return err
+	}
+	return utilfeature.DefaultMutableFeatureGate.SetFromMap(featureGates)
 }
